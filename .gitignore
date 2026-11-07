@@ -1,0 +1,26 @@
+# C++ / CMake
+build/
+build-*/
+cmake-build-*/
+CMakeLists.txt.user*
+compile_commands.json
+.cache/
+
+# Local data produced by the apps
+u3d-data/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+*.apk
+*.aab
+!android/gradle/wrapper/gradle-wrapper.jar
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

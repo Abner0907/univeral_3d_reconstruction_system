@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=U3D Studio
+GenericName=3D Reconstruction
+Comment=Reconstruct 3D scenes from photos with Nerfstudio (Gaussian Splatting / NeRF)
+Exec=U3DStudio
+Icon=u3d-studio
+Terminal=false
+Categories=Graphics;3DGraphics;

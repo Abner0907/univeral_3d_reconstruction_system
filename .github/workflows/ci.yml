@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: "6.8.3"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Qt C++: U3DStudio (GUI), u3d_server (headless), tests, packages
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: Qt ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: Windows
+            os: windows-2022
+          - name: macOS
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
+            libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then GEN="-G Ninja"; else GEN=""; fi
+          cmake -S . -B build $GEN -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # ---- packaging
+      - name: Package (Linux AppImage + server tarball)
+        if: runner.os == 'Linux'
+        run: |
+          DESTDIR=$PWD/AppDir cmake --install build --config Release
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export LDAI_OUTPUT=U3DStudio-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt --output appimage \
+            --executable AppDir/usr/bin/U3DStudio \
+            --executable AppDir/usr/bin/u3d_server \
+            --desktop-file AppDir/usr/share/applications/u3d-studio.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/u3d-studio.svg
+          mkdir -p dist
+          mv U3DStudio-x86_64.AppImage dist/
+          tar -C build/bin -czf dist/u3d-server-linux-x86_64.tar.gz u3d_server u3d_fake_ns
+
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package, dist | Out-Null
+          Copy-Item build/bin/Release/U3DStudio.exe, build/bin/Release/u3d_server.exe, build/bin/Release/u3d_fake_ns.exe package/
+          windeployqt --release --no-translations --compiler-runtime package/U3DStudio.exe
+          windeployqt --release --no-translations package/u3d_server.exe
+          Compress-Archive -Path package/* -DestinationPath dist/U3DStudio-windows-x64.zip
+
+      - name: Package (macOS dmg)
+        if: runner.os == 'macOS'
+        run: |
+          APP=build/bin/U3DStudio.app
+          cp build/bin/u3d_server build/bin/u3d_fake_ns "$APP/Contents/MacOS/"
+          macdeployqt "$APP" -executable="$APP/Contents/MacOS/u3d_server" -dmg
+          mkdir -p dist
+          mv build/bin/U3DStudio.dmg dist/U3DStudio-macos-arm64.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u3d-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Android capture app (Kotlin + CameraX)
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and unit test
+        run: ./gradlew --no-daemon assembleDebug testDebugUnitTest
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/U3DCapture-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u3d-Android
+          path: android/dist/*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # GitHub release for v* tags
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
