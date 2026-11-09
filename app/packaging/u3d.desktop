@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=U3D Viewer
+GenericName=3D Gaussian Splat Viewer
+Comment=View 3D Gaussian Splatting scans made with the U3D phone app
+Exec=U3D %f
+Icon=u3d
+Terminal=false
+MimeType=application/x-ply;
+Categories=Graphics;3DGraphics;Viewer;

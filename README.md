@@ -1,171 +1,141 @@
 # Universal 3D Reconstruction System
 
-Turn photos into 3D. Photos come from an Android phone (live CameraX capture or the gallery)
-or from the desktop. They are reconstructed with
-[Nerfstudio](https://docs.nerf.studio/), using **Gaussian Splatting** (`splatfacto`,
-rasterised by [gsplat](https://github.com/nerfstudio-project/gsplat)) or **NeRF** (`nerfacto`).
-You can then view the result in a Qt desktop app.
+U3D is a 3D scanner that runs entirely on an Android phone. You take photos with the phone's
+camera (with ARCore tracking where available) or pick them from the gallery. The phone then
+reconstructs a **3D Gaussian Splatting** model and shows it in the app. No PC, server or cloud
+is involved.
+
+The same Qt app builds for **Linux and Windows as a viewer** for the exported `.ply` files.
 
 ```
- ┌──────────────────────────┐   HTTP (LAN)    ┌──────────────────────────────────────────────┐
- │ Android: U3D Capture      │ ─────────────▶ │ U3D Studio (Qt GUI)  or  u3d_server (headless)  │
- │ Kotlin + CameraX          │  upload images │  C++ / Qt: JobManager + REST API                │
- │ • capture / auto-capture  │ ◀───────────── │   ├─ ns-process-data  (COLMAP camera poses)     │
- │ • pick from gallery       │   progress     │   ├─ ns-train splatfacto | nerfacto  (gsplat)   │
- └──────────────────────────┘                 │   └─ ns-export → result .ply → 3D viewer        │
-                                               └──────────────────────────────────────────────┘
+ Phone (Qt Quick app, C++)
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ Capture                Camera poses               Training          View    │
+ │ ARCore keyframes ───▶ ARCore poses + points ─┐                              │
+ │   or camera / gallery ─▶ SIFT + incremental ──┴─▶ 3D Gaussian ──▶ splat.ply ─▶ │
+ │                          SfM + bundle adj.        Splatting      splat viewer │
+ └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-All of our code is **C++ (Qt)**, plus **Kotlin** for the Android app. Nerfstudio is a Python
-package, so the C++ side runs its command-line tools (`ns-process-data`, `ns-train`,
-`ns-export`) as subprocesses. Our code contains no Python.
+## Why the reconstruction is not Nerfstudio
 
-| Component | Tech | Path |
+Nerfstudio and gsplat are Python/PyTorch programs that need an NVIDIA GPU with CUDA. Phones
+have neither, so this project reimplements the same algorithms in portable C++:
+
+| Step | Algorithm | Code |
 |---|---|---|
-| Core library: jobs, pipeline, HTTP server, PLY loader | C++17, Qt Core/Gui/Network | [src/core](src/core) |
-| **U3D Studio**: desktop app with job queue, logs and OpenGL 3D viewer | Qt Widgets + OpenGL | [src/gui](src/gui) |
-| **u3d_server**: headless server for GPU machines | Qt Core | [src/server](src/server) |
-| **u3d_fake_ns**: Nerfstudio simulator for dry runs and CI | C++17 | [tools/fake_ns.cpp](tools/fake_ns.cpp) |
-| **U3D Capture**: Android app | Kotlin, CameraX, OkHttp | [android](android) |
-| CI and releases | GitHub Actions | [.github/workflows/ci.yml](.github/workflows/ci.yml) |
+| Camera poses (photos only) | RootSIFT features, ratio test, fundamental-matrix RANSAC, conflict-free track building, incremental SfM (essential-matrix initial pair, EPnP + RANSAC registration, DLT triangulation), Levenberg-Marquardt bundle adjustment with Schur complement, Huber loss and shared focal length | [engine/src/sfm](engine/src/sfm) |
+| Camera poses (ARCore) | Tracked 6-DoF pose and intrinsics per keyframe, plus ARCore feature points | [app/src/ArCoreSession.cpp](app/src/ArCoreSession.cpp) |
+| Training | 3D Gaussian Splatting as in splatfacto/gsplat: EWA projection, tile-based depth-sorted alpha compositing, analytic backward pass, L1 + 0.2·D-SSIM loss, Adam, clone/split/prune densification, opacity reset | [engine/src/splat](engine/src/splat) |
+| Output | Standard 3DGS `.ply` layout (opens in common splat viewers) | [SplatPly.cpp](engine/src/splat/SplatPly.cpp) |
+| Viewer | Instanced, depth-sorted, alpha-blended splat ellipses (OpenGL ES 3.0 / GL 3.3) | [app/src/SplatView.cpp](app/src/SplatView.cpp) |
 
-## Quick start (no GPU needed)
+Training currently runs on the phone's CPU cores, multithreaded. A GPU (Vulkan compute) trainer
+is the planned next step; the multithreaded CPU trainer, verified against finite differences,
+is its reference implementation.
 
-The **dry-run** mode replaces Nerfstudio with `u3d_fake_ns`, which produces a coloured sphere.
-Use it to try the whole flow, including the phone upload, on any machine:
+## Using the app (Android)
+
+1. **New scan.** Walk slowly around the object.
+   - With **ARCore** (most recent phones): keep **Auto** on. A keyframe is saved whenever you
+     have moved about 7 cm or turned about 7°, together with the tracked camera pose and
+     feature points.
+   - Without ARCore, or with the ARCore switch off: the camera takes a photo every second in
+     Auto mode, or when you tap the shutter.
+   - Or use **Import photos** to pick 30–200 overlapping photos from the gallery.
+2. **Reconstruct.** Choose a quality preset. Everything runs on the phone and the screen stays
+   on meanwhile:
+
+   | Preset | Iterations | Training resolution | Max Gaussians |
+   |---|---|---|---|
+   | Fast | 2000 | 320 px | 80 k |
+   | Balanced | 4000 | 480 px | 150 k |
+   | High | 7000 | 640 px | 300 k |
+
+3. **View** the model: one finger orbits, two fingers pan, pinch zooms. **Export .ply** to share
+   it.
+
+Capture tips: keep the lighting even, avoid motion blur, overlap neighbouring photos by about
+70 %, and prefer textured surfaces (plain white walls and reflective or transparent objects
+reconstruct poorly).
+
+## Desktop viewer (Linux / Windows)
+
+`U3D file.ply`, or **Open .ply** in the app. Left-drag orbits, right-drag pans, the wheel zooms.
+For development, `U3D_DEV_RECONSTRUCT=1 U3D` also enables scanning and reconstruction on a
+desktop build configured with `-DU3D_WITH_SFM=ON`.
+
+## Building
+
+Requirements: CMake 3.21+, a C++17 compiler, Qt 6.5+ (Quick, QuickControls2, Multimedia),
+and for reconstruction OpenCV 4 and Eigen 3.4 (Eigen is downloaded automatically if it is
+missing).
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Engine + tests + command-line tool (Linux: apt install libopencv-dev libeigen3-dev)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DU3D_BUILD_APP=OFF
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+./build/engine/u3d_reconstruct my_project --quality fast    # my_project/images/*.jpg
 
-U3D_DRY_RUN=1 ./build/bin/U3DStudio          # or: ./build/bin/u3d_server --dry-run
+# Desktop viewer (no OpenCV needed)
+cmake -S . -B build-viewer -DCMAKE_PREFIX_PATH=~/Qt/6.8.3/gcc_64 -DU3D_WITH_SFM=OFF
+cmake --build build-viewer -j
+
+# Android APK (see .github/workflows/ci.yml for the exact steps)
+~/Qt/6.8.3/android_arm64_v8a/bin/qt-cmake -S . -B build-android -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DQT_ANDROID_ABIS=arm64-v8a \
+  -DANDROID_SDK_ROOT=$ANDROID_SDK_ROOT -DANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125 \
+  -DOpenCV_DIR=$PWD/deps/OpenCV-android-sdk/sdk/native/jni \
+  -DU3D_ARCORE_INCLUDE_DIR=$PWD/deps/arcore
+cmake --build build-android --target apk
 ```
 
-## Real reconstructions
+For Android you need the [OpenCV Android SDK](https://github.com/opencv/opencv/releases) and
+ARCore's `arcore_c_api.h`, from `libraries/include` in
+[arcore-android-sdk](https://github.com/google-ar/arcore-android-sdk). The ARCore library comes
+from the `com.google.ar:core` Gradle dependency, which is added to Qt's own `build.gradle`
+template at configure time. The app loads it at runtime, so it also works on phones without
+ARCore.
 
-1. **Install Nerfstudio** on a machine with an NVIDIA GPU (see the
-   [Nerfstudio installation guide](https://docs.nerf.studio/quickstart/installation.html)). It
-   installs `gsplat` (used by splatfacto). COLMAP and FFmpeg must also be installed:
-   ```bash
-   conda create -n nerfstudio python=3.10 -y && conda activate nerfstudio
-   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-   pip install nerfstudio
-   conda install -c conda-forge colmap ffmpeg
-   ```
-2. **Build and start U3D Studio** (Qt 6.5 or newer recommended; Qt 5.15 also works).
-3. Open **File → Preferences** and set **Nerfstudio bin folder** to the environment's `bin`
-   directory, for example `~/miniconda3/envs/nerfstudio/bin`. You can skip this if `ns-train`
-   is already on `PATH`. Make sure **dry run** is turned off.
-4. Add photos (**Images…**, **Folder…**, **Video…**, or drag and drop), pick a method, then
-   press **Start reconstruction**. Follow progress in the **Log** tab. While training runs,
-   **Live viewer** opens the Nerfstudio web viewer.
-5. When the job finishes, **View 3D** shows the result. **Save PLY…** exports it for other
-   tools, such as SuperSplat or other Gaussian-splat viewers.
+## Tests
 
-**Pipeline per job.** Each stage is one subprocess, and its output streams into the job log:
+`ctest` runs [tests/](tests):
 
-| Stage | Command | Progress |
-|---|---|---|
-| prepare | Applies EXIF rotation to the image pixels, because COLMAP ignores EXIF orientation | 0–2 % |
-| process_data | `ns-process-data images\|video --matching-method …` | 2–15 % |
-| train | `ns-train splatfacto\|nerfacto --max-num-iterations N --vis viewer …` | 15–95 % (parsed from the `Step (% Done)` table) |
-| export | `ns-export gaussian-splat` (splats) or `ns-export pointcloud` (NeRF) | 95–100 % |
+- **splat_gradients**: analytic gradients of all parameters (means, scales, rotations,
+  opacities, colours) match central finite differences (relative error below 0.1 %).
+- **splat_projection**: a rendered Gaussian matches the closed-form projected ellipse.
+- **ssim_loss**: the D-SSIM gradient check.
+- **training_recovers**: training on a synthetic scene raises PSNR from about 20 dB to over
+  26 dB.
+- **ply_round_trip**: writing and reading splat and point-cloud `.ply` files.
+- **bundle_adjustment**: on noisy synthetic data, the reprojection error drops from 16 px to
+  0.6 px and the focal length is recovered to within 0.1 %.
+- **incremental_sfm**: all 20 synthetic cameras are recovered, with camera centres within
+  0.04 % of the orbit radius.
+- **pipeline_with_arcore_poses** and **pipeline_with_structure_from_motion**: 30 rendered JPEG
+  photos of a textured box go through the full phone pipeline (29/30 photos registered by SfM).
 
-Jobs run one at a time, because a single GPU is assumed. Each job is stored in
-`<data dir>/jobs/<id>/`, so jobs survive restarts.
+## CI
 
-## Capturing with the Android app
-
-1. Install the APK from the CI artifacts or a release, or build it with
-   `cd android && ./gradlew assembleDebug`.
-2. Put the phone on the same Wi-Fi as the computer. U3D Studio's status bar shows the address
-   to use, for example `Phone uploads: http://192.168.1.20:8000`. Enter it in the app and tap
-   **Check**.
-3. Walk slowly around the object. Take 30–200 overlapping photos, or turn on **Auto** to
-   capture one every second. You can also add pictures with **Gallery**. HEIC and WebP images
-   are converted to JPEG.
-4. Tap **Reconstruct**. The app uploads the images one at a time, starts the job and shows its
-   progress. The job also appears live in U3D Studio.
-
-Capture tips: keep the lighting consistent, avoid motion blur, overlap neighbouring shots by
-about 60–80 %, and include texture (plain white surfaces reconstruct poorly).
-
-## Headless server
-
-For a remote GPU box without a desktop:
-
-```bash
-./build/bin/u3d_server --port 8000 --ns-bin-dir ~/miniconda3/envs/nerfstudio/bin --data-dir ~/u3d-data
-```
-
-Options can also be set with environment variables: `U3D_DATA_DIR`, `U3D_NS_BIN_DIR`,
-`U3D_DRY_RUN`, `U3D_NS_VIS`, `U3D_MATCHING_METHOD`, `U3D_DEFAULT_METHOD`,
-`U3D_DEFAULT_ITERATIONS`, `U3D_VIDEO_FRAMES` and `U3D_PORT`.
-
-There is also a Docker image definition, based on the official Nerfstudio image (CUDA, COLMAP
-and gsplat included). CI does not build it.
-
-```bash
-docker build -f packaging/Dockerfile -t u3d-server .
-docker run --gpus all -p 8000:8000 -p 7007:7007 -v $PWD/u3d-data:/data u3d-server
-```
-
-## REST API
-
-U3D Studio (when **Phone → Accept phone uploads** is on) and `u3d_server` serve:
-
-| Method | Path | |
-|---|---|---|
-| GET | `/api/info` | version, methods, defaults, `dry_run` |
-| GET | `/api/jobs` | `{"jobs": [...]}`, newest first |
-| POST | `/api/jobs` | `{"name","method","iterations"}` → job with status `uploading` |
-| PUT | `/api/jobs/{id}/files/{name}` | raw bytes of one image or video (needs `Content-Length`) |
-| POST | `/api/jobs/{id}/start` | validates inputs and queues the job |
-| GET | `/api/jobs/{id}` | `status`, `stage`, `progress` (0–1), `message`, `has_result` |
-| GET | `/api/jobs/{id}/log?tail=65536` | text log |
-| POST | `/api/jobs/{id}/cancel` | |
-| DELETE | `/api/jobs/{id}` | deletes the job and its files |
-| GET | `/api/jobs/{id}/result` | the result `.ply` |
-
-Example with curl:
-
-```bash
-ID=$(curl -s -X POST localhost:8000/api/jobs -d '{"method":"splatfacto"}' | jq -r .id)
-for f in photos/*.jpg; do curl -s -X PUT --data-binary @"$f" "localhost:8000/api/jobs/$ID/files/$(basename "$f")"; done
-curl -s -X POST localhost:8000/api/jobs/$ID/start
-```
-
-The API has **no authentication**. Run it only on a trusted local network.
-
-## CI and releases
-
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push and pull request:
-
-- **Qt Linux / Windows / macOS**: installs Qt 6.8, builds everything, runs the four test
-  suites (`ctest`), and packages an AppImage plus server tarball, a Windows zip (via
-  `windeployqt`) and a macOS dmg (via `macdeployqt`).
-- **Android**: runs `./gradlew assembleDebug testDebugUnitTest` and uploads the APK.
-- **Release**: pushing a tag such as `v0.1.0` attaches all of these artifacts to a GitHub
-  release.
+[.github/workflows/ci.yml](.github/workflows/ci.yml): engine tests (Linux), the viewer for
+Linux (AppImage) and Windows (zip), and the Android APK (arm64, signed with a throwaway debug
+key). Pushing a tag `v*` publishes all artifacts as a GitHub release.
 
 ## Project layout
 
 ```
-CMakeLists.txt            single CMake project (GUI, server, simulator, tests)
-src/core/                 Settings, Job, Pipeline, JobManager, ImageOrientation,
-                          HttpServer, ApiService, PlyLoader
-src/gui/                  MainWindow, PointCloudViewer (OpenGL), PreferencesDialog
-src/server/main.cpp       headless server
-tools/fake_ns.cpp         Nerfstudio simulator
-tests/                    QtTest: pipeline, PLY loader, job manager, HTTP API (end to end)
-android/                  Gradle project for the Kotlin + CameraX capture app
-packaging/                .desktop file, icon, Dockerfile
+engine/include/u3d/      public headers: Camera, Project, Reconstructor, splat/*, sfm/*
+engine/src/splat/        Gaussian model, rasterizer (forward+backward), loss, Adam, trainer, PLY
+engine/src/sfm/          features + matching, incremental SfM, bundle adjustment
+engine/src/pipeline/     project folder format, end-to-end reconstruction
+engine/tools/            u3d_reconstruct command-line tool
+app/src/                 Qt app: projects, reconstruction controller, splat viewer, ARCore capture
+app/qml/                 user interface
+app/android/             Android manifest and icon
+tests/                   engine tests
 ```
 
-## Known limitations
-
-- The desktop viewer draws each Gaussian as a coloured point, which is good for inspection.
-  For full-quality splat rendering, use **Live viewer** during training, or open the exported
-  `.ply` in a dedicated splat viewer.
-- Uploads are held in memory per file, with a 1 GiB maximum per request.
+A project folder contains `images/`, an optional `arcore/` folder (`cameras.txt`, `points.ply`)
+and `output/` (`splat.ply`, `cameras.txt`, `sparse.ply`). The format is documented in
+[Project.h](engine/include/u3d/Project.h).

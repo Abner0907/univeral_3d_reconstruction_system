@@ -16,13 +16,39 @@ permissions:
 
 env:
   QT_VERSION: "6.8.3"
+  OPENCV_ANDROID_VERSION: "4.10.0"
+  ARCORE_VERSION: "1.47.0"
+  ANDROID_NDK_VERSION: "26.1.10909125" # NDK used by Qt 6.8
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Qt C++: U3DStudio (GUI), u3d_server (headless), tests, packages
+  # Reconstruction engine (SfM + Gaussian Splatting): unit and end-to-end tests
   # ---------------------------------------------------------------------------
-  desktop:
-    name: Qt ${{ matrix.name }}
+  engine:
+    name: Engine tests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libopencv-dev libeigen3-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DU3D_BUILD_APP=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Desktop viewer
+  # ---------------------------------------------------------------------------
+  viewer:
+    name: Viewer (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,8 +58,6 @@ jobs:
             os: ubuntu-24.04
           - name: Windows
             os: windows-2022
-          - name: macOS
-            os: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -43,28 +67,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
             libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
-            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libpulse0 libva2 libva-drm2 libva-x11-2 libvdpau1
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
+          modules: qtmultimedia
           cache: true
 
       - name: Configure
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then GEN="-G Ninja"; else GEN=""; fi
-          cmake -S . -B build $GEN -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake -S . -B build $GEN -DCMAKE_BUILD_TYPE=Release -DU3D_WITH_SFM=OFF -DCMAKE_INSTALL_PREFIX=/usr
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Test
+      - name: Test (Gaussian Splatting core)
         run: ctest --test-dir build -C Release --output-on-failure
 
-      # ---- packaging
-      - name: Package (Linux AppImage + server tarball)
+      - name: Package (Linux AppImage)
         if: runner.os == 'Linux'
         run: |
           DESTDIR=$PWD/AppDir cmake --install build --config Release
@@ -73,50 +98,36 @@ jobs:
           chmod +x linuxdeploy*.AppImage
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
-          export LDAI_OUTPUT=U3DStudio-x86_64.AppImage
+          export QML_SOURCES_PATHS="$PWD/app/qml"
+          export LDAI_OUTPUT=U3D-Viewer-x86_64.AppImage
           ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt --output appimage \
-            --executable AppDir/usr/bin/U3DStudio \
-            --executable AppDir/usr/bin/u3d_server \
-            --desktop-file AppDir/usr/share/applications/u3d-studio.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/u3d-studio.svg
+            --executable AppDir/usr/bin/U3D \
+            --desktop-file AppDir/usr/share/applications/u3d.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/u3d.svg
           mkdir -p dist
-          mv U3DStudio-x86_64.AppImage dist/
-          tar -C build/bin -czf dist/u3d-server-linux-x86_64.tar.gz u3d_server u3d_fake_ns
+          mv U3D-Viewer-x86_64.AppImage dist/
 
       - name: Package (Windows zip)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package, dist | Out-Null
-          Copy-Item build/bin/Release/U3DStudio.exe, build/bin/Release/u3d_server.exe, build/bin/Release/u3d_fake_ns.exe package/
-          windeployqt --release --no-translations --compiler-runtime package/U3DStudio.exe
-          windeployqt --release --no-translations package/u3d_server.exe
-          Compress-Archive -Path package/* -DestinationPath dist/U3DStudio-windows-x64.zip
-
-      - name: Package (macOS dmg)
-        if: runner.os == 'macOS'
-        run: |
-          APP=build/bin/U3DStudio.app
-          cp build/bin/u3d_server build/bin/u3d_fake_ns "$APP/Contents/MacOS/"
-          macdeployqt "$APP" -executable="$APP/Contents/MacOS/u3d_server" -dmg
-          mkdir -p dist
-          mv build/bin/U3DStudio.dmg dist/U3DStudio-macos-arm64.dmg
+          Copy-Item build/app/Release/U3D.exe package/
+          windeployqt --release --no-translations --compiler-runtime --qmldir app/qml package/U3D.exe
+          Compress-Archive -Path package/* -DestinationPath dist/U3D-Viewer-windows-x64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: u3d-${{ matrix.name }}
+          name: u3d-viewer-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Android capture app (Kotlin + CameraX)
+  # Android app: capture (ARCore / camera) + on-device reconstruction + viewer
   # ---------------------------------------------------------------------------
   android:
-    name: Android
+    name: Android APK
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
 
@@ -125,20 +136,67 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Build and unit test
-        run: ./gradlew --no-daemon assembleDebug testDebugUnitTest
-
-      - name: Rename APK
+      - name: Install build tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}" > /dev/null
+
+      - name: Install Qt for Android
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: android
+          arch: android_arm64_v8a
+          modules: qtmultimedia
+          autodesktop: true
+          cache: true
+
+      - name: Download OpenCV Android SDK and ARCore header
+        run: |
+          mkdir -p deps && cd deps
+          wget -q "https://github.com/opencv/opencv/releases/download/${OPENCV_ANDROID_VERSION}/opencv-${OPENCV_ANDROID_VERSION}-android-sdk.zip"
+          unzip -q "opencv-${OPENCV_ANDROID_VERSION}-android-sdk.zip"
+          mkdir -p arcore
+          wget -q -O arcore/arcore_c_api.h \
+            "https://raw.githubusercontent.com/google-ar/arcore-android-sdk/v${ARCORE_VERSION}/libraries/include/arcore_c_api.h"
+
+      - name: Configure
+        run: |
+          HOST_QT="${QT_HOST_PATH:-$RUNNER_WORKSPACE/Qt/$QT_VERSION/gcc_64}"
+          "$QT_ROOT_DIR/bin/qt-cmake" -S . -B build-android -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DQT_HOST_PATH="$HOST_QT" \
+            -DANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
+            -DANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" \
+            -DQT_ANDROID_ABIS=arm64-v8a \
+            -DOpenCV_DIR="$PWD/deps/OpenCV-android-sdk/sdk/native/jni" \
+            -DU3D_ARCORE_INCLUDE_DIR="$PWD/deps/arcore" \
+            -DU3D_BUILD_TESTS=OFF
+
+      - name: Build APK
+        run: cmake --build build-android --target apk --parallel
+
+      - name: Sign APK (debug key)
+        run: |
+          APK=$(find build-android -name '*.apk' -path '*release*' | head -n1)
+          [ -n "$APK" ] || APK=$(find build-android -name '*.apk' | head -n1)
+          echo "Built: $APK"
+          BUILD_TOOLS=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -n1)
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          "$BUILD_TOOLS/zipalign" -f 4 "$APK" aligned.apk
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/U3DCapture-debug.apk
+          "$BUILD_TOOLS/apksigner" sign --ks debug.keystore --ks-pass pass:android \
+            --out dist/U3D-android-arm64.apk aligned.apk
+          "$BUILD_TOOLS/apksigner" verify dist/U3D-android-arm64.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: u3d-Android
-          path: android/dist/*.apk
+          name: u3d-android
+          path: dist/*.apk
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -147,7 +205,7 @@ jobs:
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [desktop, android]
+    needs: [engine, viewer, android]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

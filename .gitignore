@@ -1,24 +1,19 @@
-# C++ / CMake
+# CMake / build trees
 build/
 build-*/
 cmake-build-*/
 CMakeLists.txt.user*
 compile_commands.json
 .cache/
+.qt/
 
-# Local data produced by the apps
-u3d-data/
+# Downloaded CI dependencies
+deps/
 
-# Android / Gradle
-android/.gradle/
-android/build/
-android/app/build/
-android/local.properties
-android/.idea/
-*.iml
+# Android signing
+*.keystore
 *.apk
 *.aab
-!android/gradle/wrapper/gradle-wrapper.jar
 
 # Editors / OS
 .vscode/
