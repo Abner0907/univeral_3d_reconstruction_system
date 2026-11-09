@@ -142,15 +142,18 @@ jobs:
           sudo apt-get install -y ninja-build
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}" > /dev/null
 
+      # Since Qt 6.8 the Android packages are published under the host "all_os" (not "linux").
+      # --autodesktop also installs the desktop Qt (gcc_64) that cross builds need as QT_HOST_PATH.
       - name: Install Qt for Android
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          host: linux
+          host: all_os
           target: android
           arch: android_arm64_v8a
           modules: qtmultimedia
-          autodesktop: true
+          extra: --autodesktop
+          aqtversion: "==3.3.*"
           cache: true
 
       - name: Download OpenCV Android SDK and ARCore header
