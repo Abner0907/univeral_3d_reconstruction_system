@@ -43,6 +43,8 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        if (startupPage === "capture")
+            openCapture(projects.createProject("", "camera"))
         if (startupFile.toString() !== "")
             openViewer(startupFile, startupFile.toString().split("/").pop())
     }

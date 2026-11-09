@@ -10,6 +10,8 @@
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
+#include <QPointer>
+#include <QGuiApplication>
 #include <QTextStream>
 
 #include <dlfcn.h>
@@ -98,7 +100,31 @@ void *activity()
 #endif
 }
 
-// Runs fn(env) on the Android UI thread and waits up to timeoutMs. ARCore's entry points
+// Runs fn(env) on the Android UI thread without waiting.
+void postToUiThread(const std::function<void(void *env)> &fn)
+{
+#ifdef Q_OS_ANDROID
+    QNativeInterface::QAndroidApplication::runOnAndroidMainThread([fn] {
+        QJniEnvironment env;
+        fn(env.jniEnv());
+    });
+#else
+    fn(nullptr);
+#endif
+}
+
+// Delivers a callback on the Qt main thread if the guarded object still exists. (The guard is
+// created on the main thread by the caller.)
+void deliver(const QPointer<QObject> &guard, std::function<void()> fn)
+{
+    QMetaObject::invokeMethod(qApp, [guard, fn] {
+        if (guard)
+            fn();
+    }, Qt::QueuedConnection);
+}
+
+// Runs fn(env) on the Android UI thread and waits up to timeoutMs. Only for the capture
+// thread - never call this from the Qt main thread. ARCore's entry points
 // (availability, install, session create/resume/pause) look up Java classes, which only works
 // reliably from a Java thread using the app's class loader. Callers pass state through
 // shared_ptrs so a late run after a timeout never touches a dead stack frame.
@@ -232,55 +258,52 @@ QString trackingMessage(ArTrackingFailureReason reason)
 
 // ---------------------------------------------------------------------------- availability
 
-ArCoreSession::Availability ArCoreSession::checkAvailability()
+void ArCoreSession::checkAvailabilityAsync(QObject *context, std::function<void(Availability)> done)
 {
-    Api *a = api();
-    if (!a)
-        return Availability::Unsupported;
-    auto result = std::make_shared<std::atomic_int>(-1);
-    void *act = activity();
-    runOnUiThread([a, act, result](void *env) {
-        ArAvailability availability = AR_AVAILABILITY_UNKNOWN_ERROR;
-        a->ArCoreApk_checkAvailability(env, act, &availability);
-        result->store(int(availability));
-    }, 3000);
-    switch (result->load()) {
-    case -1: return Availability::Checking; // UI thread busy: ask again later
-    case AR_AVAILABILITY_SUPPORTED_INSTALLED: return Availability::Supported;
-    case AR_AVAILABILITY_SUPPORTED_APK_TOO_OLD:
-    case AR_AVAILABILITY_SUPPORTED_NOT_INSTALLED: return Availability::NeedsInstall;
-    case AR_AVAILABILITY_UNKNOWN_CHECKING: return Availability::Checking;
-    default: return Availability::Unsupported;
-    }
-}
-
-bool ArCoreSession::requestInstall(QString *message)
-{
+    QPointer<QObject> guard(context);
     Api *a = api();
     if (!a) {
-        *message = tr("ARCore is not available on this device.");
-        return false;
+        deliver(guard, [done] { done(Availability::Unsupported); });
+        return;
     }
-    struct Result {
-        std::atomic_bool ran{false};
-        ArStatus status = AR_ERROR_FATAL;
-        ArInstallStatus install = AR_INSTALL_STATUS_INSTALLED;
-    };
-    auto r = std::make_shared<Result>();
     void *act = activity();
-    runOnUiThread([a, act, r](void *env) {
-        r->status = a->ArCoreApk_requestInstall(env, act, 1, &r->install);
-        r->ran.store(true);
-    }, 10000);
-    if (!r->ran.load() || r->status != AR_SUCCESS) {
-        *message = tr("Google Play Services for AR could not be installed.");
-        return false;
+    postToUiThread([a, act, guard, done](void *env) {
+        ArAvailability availability = AR_AVAILABILITY_UNKNOWN_ERROR;
+        a->ArCoreApk_checkAvailability(env, act, &availability);
+        Availability result = Availability::Unsupported;
+        switch (availability) {
+        case AR_AVAILABILITY_SUPPORTED_INSTALLED: result = Availability::Supported; break;
+        case AR_AVAILABILITY_SUPPORTED_APK_TOO_OLD:
+        case AR_AVAILABILITY_SUPPORTED_NOT_INSTALLED: result = Availability::NeedsInstall; break;
+        case AR_AVAILABILITY_UNKNOWN_CHECKING: result = Availability::Checking; break;
+        default: break;
+        }
+        deliver(guard, [done, result] { done(result); });
+    });
+}
+
+void ArCoreSession::requestInstallAsync(QObject *context, std::function<void(bool, QString)> done)
+{
+    QPointer<QObject> guard(context);
+    Api *a = api();
+    if (!a) {
+        deliver(guard, [done] { done(false, tr("ARCore is not available on this device.")); });
+        return;
     }
-    if (r->install == AR_INSTALL_STATUS_INSTALL_REQUESTED) {
-        *message = tr("Installing Google Play Services for AR - start the capture again afterwards.");
-        return false;
-    }
-    return true;
+    void *act = activity();
+    postToUiThread([a, act, guard, done](void *env) {
+        ArInstallStatus install = AR_INSTALL_STATUS_INSTALLED;
+        const ArStatus status = a->ArCoreApk_requestInstall(env, act, 1, &install);
+        bool installed = false;
+        QString message;
+        if (status != AR_SUCCESS)
+            message = tr("Google Play Services for AR could not be installed.");
+        else if (install == AR_INSTALL_STATUS_INSTALL_REQUESTED)
+            message = tr("Installing Google Play Services for AR - start the capture again afterwards.");
+        else
+            installed = true;
+        deliver(guard, [done, installed, message] { done(installed, message); });
+    });
 }
 
 QImage ArCoreSession::latestPreview()
@@ -497,9 +520,12 @@ void ArCoreSession::run()
             }
         }
 
-        // Keyframe decision.
-        bool capture = m_captureRequested.exchange(false) && tracking;
-        if (!capture && tracking && m_autoCapture.load() && sinceCapture.elapsed() > 300) {
+        // Keyframe decision. The shutter always takes a photo; photos taken while not
+        // tracking have no pose and the project then falls back to structure-from-motion.
+        bool capture = m_captureRequested.exchange(false);
+        if (!capture && !tracking && m_autoCapture.load() && sinceCapture.elapsed() > 1000) {
+            capture = true; // not tracking (yet): one photo per second
+        } else if (!capture && tracking && m_autoCapture.load() && sinceCapture.elapsed() > 300) {
             if (!haveKeyframe) {
                 capture = true;
             } else {
@@ -528,7 +554,7 @@ void ArCoreSession::run()
                         const double sy = K.height > 0 ? double(full.height()) / K.height : 1.0;
                         const bool isNew = !QFile::exists(camerasPath);
                         QFile file(camerasPath);
-                        if (file.open(QIODevice::Append | QIODevice::Text)) {
+                        if (tracking && file.open(QIODevice::Append | QIODevice::Text)) {
                             QTextStream out(&file);
                             out.setRealNumberPrecision(10);
                             if (isNew)
@@ -543,6 +569,8 @@ void ArCoreSession::run()
                         }
                         // Colour the map points visible in this photo.
                         for (auto &kv : points) {
+                            if (!tracking)
+                                break;
                             MapPoint &mp = kv.second;
                             const double X = mp.xyz[0], Y = mp.xyz[1], Z = mp.xyz[2];
                             const double pz = pose.R[6] * X + pose.R[7] * Y + pose.R[8] * Z + pose.t[2];
@@ -560,8 +588,10 @@ void ArCoreSession::run()
                             mp.rgb[2] += qBlue(c) / 255.0f;
                             ++mp.colorSamples;
                         }
-                        lastKeyframe = pose;
-                        haveKeyframe = true;
+                        if (tracking) {
+                            lastKeyframe = pose;
+                            haveKeyframe = true;
+                        }
                         sinceCapture.restart();
                         emit frameSaved(frames, int(points.size()));
                     }

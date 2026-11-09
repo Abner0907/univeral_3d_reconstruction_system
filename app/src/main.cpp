@@ -41,6 +41,8 @@ int main(int argc, char *argv[])
     engine.rootContext()->setContextProperty(
         QStringLiteral("startupFile"),
         args.size() > 1 ? QUrl::fromUserInput(args.at(1), QDir::currentPath(), QUrl::AssumeLocalFile) : QUrl());
+    // Development: U3D_DEV_PAGE=capture opens the capture page of a new scan at start-up.
+    engine.rootContext()->setContextProperty(QStringLiteral("startupPage"), qEnvironmentVariable("U3D_DEV_PAGE"));
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed, &app,
                      [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
     engine.loadFromModule("U3D", "Main");

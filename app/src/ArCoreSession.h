@@ -5,6 +5,7 @@
 #include <QThread>
 
 #include <atomic>
+#include <functional>
 
 class QOffscreenSurface;
 class QOpenGLContext;
@@ -23,9 +24,12 @@ class ArCoreSession : public QThread
 public:
     enum class Availability { Unsupported, Supported, NeedsInstall, Checking };
 
-    static Availability checkAvailability();
-    // Starts Google Play Services for AR installation if needed; returns true once installed.
-    static bool requestInstall(QString *message);
+    // Both run on the Android UI thread and report back on the Qt main thread through `context`
+    // (never blocking it: the UI thread itself may be waiting for the Qt thread, e.g. while
+    // the permission dialog pauses the activity).
+    static void checkAvailabilityAsync(QObject *context, std::function<void(Availability)> done);
+    // Starts Google Play Services for AR installation if needed; installed == true when ready.
+    static void requestInstallAsync(QObject *context, std::function<void(bool installed, QString message)> done);
 
     explicit ArCoreSession(const QString &projectPath, QObject *parent = nullptr);
     ~ArCoreSession() override;

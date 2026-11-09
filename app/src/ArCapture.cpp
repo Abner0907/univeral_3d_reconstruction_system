@@ -3,8 +3,8 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QPermissions>
-#include <QSettings>
 #include <QQuickImageProvider>
+#include <QSettings>
 #include <QTimer>
 
 #ifdef U3D_HAS_ARCORE
@@ -37,12 +37,13 @@ public:
     }
 };
 
-} // namespace
-
-namespace {
 // Set while an ARCore call that could crash the process is in progress. If it is still set at
 // start-up, the previous attempt killed the app, so ARCore stays off until the user retries.
 const char *kGuardKey = "arcore/inProgress";
+
+// ARCore must deliver camera frames within this time, otherwise the plain camera is used.
+constexpr int kFirstFrameTimeoutMs = 8000;
+
 } // namespace
 
 ArCapture::ArCapture(QObject *parent)
@@ -59,21 +60,6 @@ ArCapture::ArCapture(QObject *parent)
     checkAvailability();
 }
 
-void ArCapture::setGuard(bool risky)
-{
-    QSettings settings;
-    settings.setValue(QLatin1String(kGuardKey), risky);
-    settings.sync(); // must reach disk before a possible crash
-}
-
-void ArCapture::retryArCore()
-{
-    m_crashedLastTime = false;
-    m_ready = false;
-    emit availableChanged();
-    checkAvailability();
-}
-
 ArCapture::~ArCapture()
 {
     stop();
@@ -82,6 +68,13 @@ ArCapture::~ArCapture()
 QQuickImageProvider *ArCapture::createImageProvider()
 {
     return new PreviewProvider();
+}
+
+void ArCapture::setGuard(bool risky)
+{
+    QSettings settings;
+    settings.setValue(QLatin1String(kGuardKey), risky);
+    settings.sync(); // must reach disk before a possible crash
 }
 
 void ArCapture::setStatus(const QString &status)
@@ -104,69 +97,81 @@ void ArCapture::setAutoCapture(bool on)
     emit autoCaptureChanged();
 }
 
+void ArCapture::retryArCore()
+{
+    m_crashedLastTime = false;
+    m_ready = false;
+    setStatus(QString());
+    emit availableChanged();
+    checkAvailability();
+}
+
 void ArCapture::checkAvailability()
 {
     if (m_crashedLastTime)
         return;
 #ifdef U3D_HAS_ARCORE
     setGuard(true);
-    const auto availability = ArCoreSession::checkAvailability();
-    setGuard(false);
-    if (availability == ArCoreSession::Availability::Checking) {
-        // The check runs asynchronously the first time; ask again shortly.
-        QTimer::singleShot(300, this, &ArCapture::checkAvailability);
-        return;
-    }
-    const bool available = availability == ArCoreSession::Availability::Supported
-                           || availability == ArCoreSession::Availability::NeedsInstall;
-    m_available = available;
-#endif
+    ArCoreSession::checkAvailabilityAsync(this, [this](ArCoreSession::Availability availability) {
+        setGuard(false);
+        if (availability == ArCoreSession::Availability::Checking) {
+            // The first check runs asynchronously inside ARCore; ask again shortly.
+            QTimer::singleShot(500, this, &ArCapture::checkAvailability);
+            return;
+        }
+        m_available = availability == ArCoreSession::Availability::Supported
+                      || availability == ArCoreSession::Availability::NeedsInstall;
+        m_ready = true;
+        emit availableChanged();
+    });
+#else
     m_ready = true;
     emit availableChanged();
+#endif
 }
 
 void ArCapture::start(const QString &projectPath)
 {
-    if (m_session)
+    if (m_session || m_starting)
         return;
 #if QT_CONFIG(permissions)
-    QCameraPermission permission;
-    switch (qApp->checkPermission(permission)) {
-    case Qt::PermissionStatus::Undetermined:
-        qApp->requestPermission(permission, this, [this, projectPath](const QPermission &p) {
-            if (p.status() == Qt::PermissionStatus::Granted)
-                startSession(projectPath);
-            else
-                emit failed(tr("Camera permission is required to capture."));
-        });
+    // The capture page requests the permission; ARCore only starts once it is granted.
+    if (qApp->checkPermission(QCameraPermission()) != Qt::PermissionStatus::Granted) {
+        emit failed(tr("Camera permission is required to capture."));
         return;
-    case Qt::PermissionStatus::Denied:
-        emit failed(tr("Camera permission was denied. Enable it in the system settings."));
-        return;
-    case Qt::PermissionStatus::Granted:
-        break;
     }
 #endif
-    startSession(projectPath);
+#ifdef U3D_HAS_ARCORE
+    m_starting = true;
+    setStatus(tr("Starting ARCore..."));
+    setGuard(true);
+    ArCoreSession::requestInstallAsync(this, [this, projectPath](bool installed, const QString &message) {
+        setGuard(false);
+        m_starting = false;
+        if (!installed) {
+            setStatus(message);
+            emit failed(message);
+            return;
+        }
+        startSession(projectPath);
+    });
+#else
+    Q_UNUSED(projectPath)
+    emit failed(tr("ARCore is not available in this build."));
+#endif
 }
 
 void ArCapture::startSession(const QString &projectPath)
 {
 #ifdef U3D_HAS_ARCORE
-    QString message;
-    setGuard(true);
-    const bool installed = ArCoreSession::requestInstall(&message);
-    setGuard(false);
-    if (!installed) {
-        setStatus(message);
-        emit failed(message);
-        return;
-    }
-    m_frames = int(QDir(QDir(projectPath).filePath(QStringLiteral("images"))).entryList({QStringLiteral("*.jpg")}, QDir::Files).size());
+    m_frames = int(QDir(QDir(projectPath).filePath(QStringLiteral("images")))
+                       .entryList({QStringLiteral("*.jpg")}, QDir::Files).size());
     m_points = 0;
     emit framesChanged();
-    m_session = new ArCoreSession(projectPath, this);
+    m_session = new ArCoreSession(projectPath);
     m_session->setAutoCapture(m_autoCapture);
+    // The thread cleans itself up when it ends, even if this object is gone by then.
+    connect(m_session, &QThread::finished, m_session, &QObject::deleteLater);
     connect(m_session, &ArCoreSession::trackingChanged, this, [this](bool tracking, const QString &msg) {
         if (tracking && !m_tracking)
             setGuard(false); // ARCore is up and running
@@ -185,16 +190,25 @@ void ArCapture::startSession(const QString &projectPath)
     });
     connect(m_session, &ArCoreSession::failed, this, [this](const QString &msg) {
         setStatus(msg);
-        emit failed(msg);
         stop();
+        emit failed(msg);
     });
-    setStatus(tr("Starting ARCore..."));
     setGuard(true); // cleared once tracking starts or the session stops normally
     m_session->start();
     emit runningChanged();
+
+    // Watchdog: no camera frames -> give up on ARCore for this capture.
+    const int revision = m_previewRevision;
+    QTimer::singleShot(kFirstFrameTimeoutMs, this, [this, revision] {
+        if (m_session && m_previewRevision == revision) {
+            const QString msg = tr("ARCore did not deliver camera images; switched to the normal camera.");
+            setStatus(msg);
+            stop();
+            emit failed(msg);
+        }
+    });
 #else
     Q_UNUSED(projectPath)
-    emit failed(tr("ARCore is not available in this build."));
 #endif
 }
 
@@ -203,11 +217,12 @@ void ArCapture::stop()
 #ifdef U3D_HAS_ARCORE
     if (!m_session)
         return;
+    // Never wait here: the capture thread may itself be waiting for the Android UI thread.
+    // It finishes on its own (writing arcore/points.ply) and deletes itself.
     ArCoreSession *session = m_session;
     m_session = nullptr;
+    disconnect(session, nullptr, this, nullptr);
     session->requestStop();
-    session->wait(); // writes arcore/points.ply before returning
-    session->deleteLater();
     setGuard(false);
     m_tracking = false;
     emit statusChanged();

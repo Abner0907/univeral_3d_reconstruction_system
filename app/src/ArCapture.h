@@ -35,7 +35,7 @@ public:
     ~ArCapture() override;
 
     bool available() const { return m_available; }
-    bool running() const { return m_session != nullptr; }
+    bool running() const { return m_session != nullptr || m_starting; }
     bool tracking() const { return m_tracking; }
     QString status() const { return m_status; }
     int frameCount() const { return m_frames; }
@@ -77,5 +77,6 @@ private:
     int m_previewRevision = 0;
     bool m_ready = false;
     bool m_crashedLastTime = false;
+    bool m_starting = false;
     ArCoreSession *m_session = nullptr;
 };

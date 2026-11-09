@@ -15,13 +15,20 @@ Page {
     property string projectPath
     property int plainCount: 0
     readonly property bool arMode: ar.available && arSwitch.checked
+    readonly property bool permissionGranted: cameraPermission.status === Qt.PermissionStatus.Granted
 
     ArCapture {
         id: ar
-        onFailed: (message) => errorLabel.text = message
+        // Any ARCore problem: carry on with the normal camera and say why.
+        onFailed: (message) => {
+            errorLabel.text = message
+            arSwitch.checked = false
+        }
+        onFrameCountChanged: flash.restart()
     }
 
     CameraPermission { id: cameraPermission }
+    onPermissionGrantedChanged: updateSession()
 
     Component.onCompleted: {
         if (cameraPermission.status !== Qt.PermissionStatus.Granted)
@@ -30,7 +37,7 @@ Page {
     }
     onArModeChanged: updateSession()
     function updateSession() {
-        if (arMode && !ar.running)
+        if (arMode && permissionGranted && !ar.running)
             ar.start(projectPath)
         else if (!arMode && ar.running)
             ar.stop()
@@ -86,7 +93,7 @@ Page {
             }
             imageCapture: ImageCapture {
                 id: imageCapture
-                onImageSaved: page.plainCount += 1
+                onImageSaved: { page.plainCount += 1; flash.restart() }
                 onErrorOccurred: (id, error, message) => errorLabel.text = message
             }
             videoOutput: videoOutput
@@ -97,6 +104,33 @@ Page {
             visible: !page.arMode
             fillMode: VideoOutput.PreserveAspectCrop
         }
+        // What the camera is waiting for (instead of a silent black screen).
+        Label {
+            anchors.centerIn: parent
+            width: parent.width * 0.8
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            color: "white"
+            visible: page.arMode ? ar.previewRevision === 0 : !camera.active || !imageCapture.readyForCapture
+            text: !page.permissionGranted ? qsTr("Waiting for camera permission...")
+                  : !ar.ready ? qsTr("Checking ARCore...")
+                  : page.arMode ? qsTr("Starting ARCore camera...")
+                  : qsTr("Starting camera...")
+        }
+
+        // White flash whenever a photo is saved.
+        Rectangle {
+            id: flashRect
+            anchors.fill: parent
+            color: "white"
+            opacity: 0
+            SequentialAnimation {
+                id: flash
+                NumberAnimation { target: flashRect; property: "opacity"; to: 0.6; duration: 40 }
+                NumberAnimation { target: flashRect; property: "opacity"; to: 0; duration: 160 }
+            }
+        }
+
         Timer {
             id: plainAuto
             interval: 1000
