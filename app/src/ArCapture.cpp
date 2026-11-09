@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QPermissions>
+#include <QSettings>
 #include <QQuickImageProvider>
 #include <QTimer>
 
@@ -38,9 +39,38 @@ public:
 
 } // namespace
 
+namespace {
+// Set while an ARCore call that could crash the process is in progress. If it is still set at
+// start-up, the previous attempt killed the app, so ARCore stays off until the user retries.
+const char *kGuardKey = "arcore/inProgress";
+} // namespace
+
 ArCapture::ArCapture(QObject *parent)
     : QObject(parent)
 {
+    QSettings settings;
+    if (settings.value(QLatin1String(kGuardKey), false).toBool()) {
+        m_crashedLastTime = true;
+        m_ready = true;
+        settings.setValue(QLatin1String(kGuardKey), false);
+        m_status = tr("ARCore stopped unexpectedly last time, so the normal camera is used.");
+        return;
+    }
+    checkAvailability();
+}
+
+void ArCapture::setGuard(bool risky)
+{
+    QSettings settings;
+    settings.setValue(QLatin1String(kGuardKey), risky);
+    settings.sync(); // must reach disk before a possible crash
+}
+
+void ArCapture::retryArCore()
+{
+    m_crashedLastTime = false;
+    m_ready = false;
+    emit availableChanged();
     checkAvailability();
 }
 
@@ -76,8 +106,12 @@ void ArCapture::setAutoCapture(bool on)
 
 void ArCapture::checkAvailability()
 {
+    if (m_crashedLastTime)
+        return;
 #ifdef U3D_HAS_ARCORE
+    setGuard(true);
     const auto availability = ArCoreSession::checkAvailability();
+    setGuard(false);
     if (availability == ArCoreSession::Availability::Checking) {
         // The check runs asynchronously the first time; ask again shortly.
         QTimer::singleShot(300, this, &ArCapture::checkAvailability);
@@ -85,11 +119,10 @@ void ArCapture::checkAvailability()
     }
     const bool available = availability == ArCoreSession::Availability::Supported
                            || availability == ArCoreSession::Availability::NeedsInstall;
-    if (available != m_available) {
-        m_available = available;
-        emit availableChanged();
-    }
+    m_available = available;
 #endif
+    m_ready = true;
+    emit availableChanged();
 }
 
 void ArCapture::start(const QString &projectPath)
@@ -121,7 +154,10 @@ void ArCapture::startSession(const QString &projectPath)
 {
 #ifdef U3D_HAS_ARCORE
     QString message;
-    if (!ArCoreSession::requestInstall(&message)) {
+    setGuard(true);
+    const bool installed = ArCoreSession::requestInstall(&message);
+    setGuard(false);
+    if (!installed) {
         setStatus(message);
         emit failed(message);
         return;
@@ -132,6 +168,8 @@ void ArCapture::startSession(const QString &projectPath)
     m_session = new ArCoreSession(projectPath, this);
     m_session->setAutoCapture(m_autoCapture);
     connect(m_session, &ArCoreSession::trackingChanged, this, [this](bool tracking, const QString &msg) {
+        if (tracking && !m_tracking)
+            setGuard(false); // ARCore is up and running
         m_tracking = tracking;
         m_status = msg;
         emit statusChanged();
@@ -151,6 +189,7 @@ void ArCapture::startSession(const QString &projectPath)
         stop();
     });
     setStatus(tr("Starting ARCore..."));
+    setGuard(true); // cleared once tracking starts or the session stops normally
     m_session->start();
     emit runningChanged();
 #else
@@ -169,6 +208,7 @@ void ArCapture::stop()
     session->requestStop();
     session->wait(); // writes arcore/points.ply before returning
     session->deleteLater();
+    setGuard(false);
     m_tracking = false;
     emit statusChanged();
     emit runningChanged();

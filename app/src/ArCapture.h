@@ -24,6 +24,11 @@ class ArCapture : public QObject
     Q_PROPERTY(int pointCount READ pointCount NOTIFY framesChanged)
     Q_PROPERTY(bool autoCapture READ autoCapture WRITE setAutoCapture NOTIFY autoCaptureChanged)
     Q_PROPERTY(int previewRevision READ previewRevision NOTIFY previewChanged)
+    // True once the availability check has finished (the plain camera waits for it so the two
+    // never compete for the camera).
+    Q_PROPERTY(bool ready READ ready NOTIFY availableChanged)
+    // ARCore crashed the app last time; it stays off until retryArCore() is called.
+    Q_PROPERTY(bool crashedLastTime READ crashedLastTime NOTIFY availableChanged)
 
 public:
     explicit ArCapture(QObject *parent = nullptr);
@@ -38,11 +43,14 @@ public:
     bool autoCapture() const { return m_autoCapture; }
     void setAutoCapture(bool on);
     int previewRevision() const { return m_previewRevision; }
+    bool ready() const { return m_ready; }
+    bool crashedLastTime() const { return m_crashedLastTime; }
 
     Q_INVOKABLE void checkAvailability();
     Q_INVOKABLE void start(const QString &projectPath);
     Q_INVOKABLE void stop();
     Q_INVOKABLE void captureNow();
+    Q_INVOKABLE void retryArCore();
 
     static QQuickImageProvider *createImageProvider();
 
@@ -58,6 +66,7 @@ signals:
 private:
     void startSession(const QString &projectPath);
     void setStatus(const QString &status);
+    void setGuard(bool risky);
 
     bool m_available = false;
     bool m_tracking = false;
@@ -66,5 +75,7 @@ private:
     int m_points = 0;
     bool m_autoCapture = true;
     int m_previewRevision = 0;
+    bool m_ready = false;
+    bool m_crashedLastTime = false;
     ArCoreSession *m_session = nullptr;
 };

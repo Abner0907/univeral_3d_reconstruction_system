@@ -14,6 +14,9 @@
 
 #include <dlfcn.h>
 
+#include <functional>
+#include <memory>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +26,7 @@
 
 #ifdef Q_OS_ANDROID
 #include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QtCore/qcoreapplication_platform.h>
 #include <QJniEnvironment>
 #include <QJniObject>
@@ -81,22 +85,41 @@ Api *api()
     return a.loaded ? &a : nullptr;
 }
 
-void *jniEnv()
+// The Android Activity, referenced for the lifetime of the app. (Returning
+// context().object() from a temporary QJniObject would hand ARCore a JNI reference that is
+// deleted at the end of the statement - an immediate JNI abort.)
+void *activity()
 {
 #ifdef Q_OS_ANDROID
-    QJniEnvironment env;
-    return env.jniEnv();
+    static QJniObject activityObject = QNativeInterface::QAndroidApplication::context();
+    return activityObject.object();
 #else
     return nullptr;
 #endif
 }
 
-void *activity()
+// Runs fn(env) on the Android UI thread and waits up to timeoutMs. ARCore's entry points
+// (availability, install, session create/resume/pause) look up Java classes, which only works
+// reliably from a Java thread using the app's class loader. Callers pass state through
+// shared_ptrs so a late run after a timeout never touches a dead stack frame.
+// Returns false on timeout.
+bool runOnUiThread(const std::function<void(void *env)> &fn, int timeoutMs)
 {
 #ifdef Q_OS_ANDROID
-    return QNativeInterface::QAndroidApplication::context().object();
+    auto done = std::make_shared<std::atomic_bool>(false);
+    auto future = QNativeInterface::QAndroidApplication::runOnAndroidMainThread(
+        [fn, done] {
+            QJniEnvironment env;
+            fn(env.jniEnv());
+            done->store(true);
+        },
+        QDeadlineTimer(timeoutMs));
+    future.waitForFinished();
+    return done->load();
 #else
-    return nullptr;
+    Q_UNUSED(timeoutMs)
+    fn(nullptr);
+    return true;
 #endif
 }
 
@@ -214,9 +237,15 @@ ArCoreSession::Availability ArCoreSession::checkAvailability()
     Api *a = api();
     if (!a)
         return Availability::Unsupported;
-    ArAvailability availability = AR_AVAILABILITY_UNKNOWN_ERROR;
-    a->ArCoreApk_checkAvailability(jniEnv(), activity(), &availability);
-    switch (availability) {
+    auto result = std::make_shared<std::atomic_int>(-1);
+    void *act = activity();
+    runOnUiThread([a, act, result](void *env) {
+        ArAvailability availability = AR_AVAILABILITY_UNKNOWN_ERROR;
+        a->ArCoreApk_checkAvailability(env, act, &availability);
+        result->store(int(availability));
+    }, 3000);
+    switch (result->load()) {
+    case -1: return Availability::Checking; // UI thread busy: ask again later
     case AR_AVAILABILITY_SUPPORTED_INSTALLED: return Availability::Supported;
     case AR_AVAILABILITY_SUPPORTED_APK_TOO_OLD:
     case AR_AVAILABILITY_SUPPORTED_NOT_INSTALLED: return Availability::NeedsInstall;
@@ -232,12 +261,22 @@ bool ArCoreSession::requestInstall(QString *message)
         *message = tr("ARCore is not available on this device.");
         return false;
     }
-    ArInstallStatus status = AR_INSTALL_STATUS_INSTALLED;
-    if (a->ArCoreApk_requestInstall(jniEnv(), activity(), 1, &status) != AR_SUCCESS) {
+    struct Result {
+        std::atomic_bool ran{false};
+        ArStatus status = AR_ERROR_FATAL;
+        ArInstallStatus install = AR_INSTALL_STATUS_INSTALLED;
+    };
+    auto r = std::make_shared<Result>();
+    void *act = activity();
+    runOnUiThread([a, act, r](void *env) {
+        r->status = a->ArCoreApk_requestInstall(env, act, 1, &r->install);
+        r->ran.store(true);
+    }, 10000);
+    if (!r->ran.load() || r->status != AR_SUCCESS) {
         *message = tr("Google Play Services for AR could not be installed.");
         return false;
     }
-    if (status == AR_INSTALL_STATUS_INSTALL_REQUESTED) {
+    if (r->install == AR_INSTALL_STATUS_INSTALL_REQUESTED) {
         *message = tr("Installing Google Play Services for AR - start the capture again afterwards.");
         return false;
     }
@@ -286,66 +325,89 @@ void ArCoreSession::run()
         return;
     }
 
-    ArSession *session = nullptr;
-    if (a->ArSession_create(jniEnv(), activity(), &session) != AR_SUCCESS || !session) {
-        m_context->doneCurrent();
-        emit failed(tr("Could not start ARCore (is the camera permission granted?)."));
-        return;
-    }
-
-    ArConfig *config = nullptr;
-    a->ArConfig_create(session, &config);
-    a->ArConfig_setFocusMode(session, config, AR_FOCUS_MODE_AUTO);
-    a->ArConfig_setUpdateMode(session, config, AR_UPDATE_MODE_BLOCKING);
-    a->ArSession_configure(session, config);
-    a->ArConfig_destroy(config);
-
-    // Largest CPU image up to 1920 px wide: the photos used for reconstruction.
-    {
-        ArCameraConfigFilter *filter = nullptr;
-        ArCameraConfigList *list = nullptr;
-        ArCameraConfig *cfg = nullptr;
-        a->ArCameraConfigFilter_create(session, &filter);
-        a->ArCameraConfigList_create(session, &list);
-        a->ArSession_getSupportedCameraConfigsWithFilter(session, filter, list);
-        a->ArCameraConfig_create(session, &cfg);
-        int32_t count = 0, best = -1;
-        long bestPixels = 0;
-        a->ArCameraConfigList_getSize(session, list, &count);
-        for (int32_t i = 0; i < count; ++i) {
-            a->ArCameraConfigList_getItem(session, list, i, cfg);
-            int32_t w = 0, h = 0;
-            a->ArCameraConfig_getImageDimensions(session, cfg, &w, &h);
-            if (w <= 1920 && long(w) * h > bestPixels) {
-                bestPixels = long(w) * h;
-                best = i;
-            }
-        }
-        if (best >= 0) {
-            a->ArCameraConfigList_getItem(session, list, best, cfg);
-            a->ArSession_setCameraConfig(session, cfg);
-        }
-        a->ArCameraConfig_destroy(cfg);
-        a->ArCameraConfigList_destroy(list);
-        a->ArCameraConfigFilter_destroy(filter);
-    }
-
+    // Camera texture for ARCore (owned by this thread's GL context).
     QOpenGLFunctions *gl = m_context->functions();
     GLuint texture = 0;
     gl->glGenTextures(1, &texture);
     gl->glBindTexture(kTextureExternalOes, texture);
     gl->glTexParameteri(kTextureExternalOes, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     gl->glTexParameteri(kTextureExternalOes, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    a->ArSession_setCameraTextureName(session, texture);
-    a->ArSession_setDisplayGeometry(session, 0, 1080, 1920);
 
-    if (a->ArSession_resume(session) != AR_SUCCESS) {
-        a->ArSession_destroy(session);
+    // Create, configure and resume the session on the Android UI thread.
+    struct Startup {
+        std::atomic_bool done{false};
+        std::atomic_bool abandoned{false};
+        ArSession *session = nullptr;
+        QString error;
+    };
+    auto startup = std::make_shared<Startup>();
+    void *act = activity();
+    const bool finished = runOnUiThread([a, act, startup, texture](void *env) {
+        ArSession *s = nullptr;
+        if (a->ArSession_create(env, act, &s) != AR_SUCCESS || !s) {
+            startup->error = tr("Could not start ARCore (is the camera permission granted?).");
+            startup->done.store(true);
+            return;
+        }
+        ArConfig *config = nullptr;
+        a->ArConfig_create(s, &config);
+        a->ArConfig_setFocusMode(s, config, AR_FOCUS_MODE_AUTO);
+        a->ArConfig_setUpdateMode(s, config, AR_UPDATE_MODE_BLOCKING);
+        a->ArSession_configure(s, config);
+        a->ArConfig_destroy(config);
+
+        // Largest CPU image up to 1920 px wide: the photos used for reconstruction.
+        ArCameraConfigFilter *filter = nullptr;
+        ArCameraConfigList *list = nullptr;
+        ArCameraConfig *cfg = nullptr;
+        a->ArCameraConfigFilter_create(s, &filter);
+        a->ArCameraConfigList_create(s, &list);
+        a->ArSession_getSupportedCameraConfigsWithFilter(s, filter, list);
+        a->ArCameraConfig_create(s, &cfg);
+        int32_t count = 0, best = -1;
+        long bestPixels = 0;
+        a->ArCameraConfigList_getSize(s, list, &count);
+        for (int32_t i = 0; i < count; ++i) {
+            a->ArCameraConfigList_getItem(s, list, i, cfg);
+            int32_t w = 0, h = 0;
+            a->ArCameraConfig_getImageDimensions(s, cfg, &w, &h);
+            if (w <= 1920 && long(w) * h > bestPixels) {
+                bestPixels = long(w) * h;
+                best = i;
+            }
+        }
+        if (best >= 0) {
+            a->ArCameraConfigList_getItem(s, list, best, cfg);
+            a->ArSession_setCameraConfig(s, cfg);
+        }
+        a->ArCameraConfig_destroy(cfg);
+        a->ArCameraConfigList_destroy(list);
+        a->ArCameraConfigFilter_destroy(filter);
+
+        a->ArSession_setCameraTextureName(s, texture);
+        a->ArSession_setDisplayGeometry(s, 0, 1080, 1920);
+        if (a->ArSession_resume(s) != AR_SUCCESS) {
+            a->ArSession_destroy(s);
+            startup->error = tr("Could not open the camera for ARCore.");
+            startup->done.store(true);
+            return;
+        }
+        if (startup->abandoned.load()) { // the capture thread gave up waiting
+            a->ArSession_pause(s);
+            a->ArSession_destroy(s);
+            return;
+        }
+        startup->session = s;
+        startup->done.store(true);
+    }, 15000);
+    if (!finished || !startup->done.load() || !startup->session) {
+        startup->abandoned.store(true);
         gl->glDeleteTextures(1, &texture);
         m_context->doneCurrent();
-        emit failed(tr("Could not open the camera for ARCore."));
+        emit failed(startup->error.isEmpty() ? tr("ARCore did not start in time.") : startup->error);
         return;
     }
+    ArSession *session = startup->session;
 
     ArFrame *frame = nullptr;
     a->ArFrame_create(session, &frame);
@@ -548,7 +610,7 @@ void ArCoreSession::run()
     a->ArCameraIntrinsics_destroy(arIntrinsics);
     a->ArPose_destroy(arPose);
     a->ArFrame_destroy(frame);
-    a->ArSession_pause(session);
+    runOnUiThread([a, session](void *) { a->ArSession_pause(session); }, 5000);
     a->ArSession_destroy(session);
     gl->glDeleteTextures(1, &texture);
     m_context->doneCurrent();

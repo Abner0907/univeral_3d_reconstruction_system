@@ -82,7 +82,7 @@ Page {
         CaptureSession {
             camera: Camera {
                 id: camera
-                active: !page.arMode && cameraPermission.status === Qt.PermissionStatus.Granted
+                active: ar.ready && !page.arMode && cameraPermission.status === Qt.PermissionStatus.Granted
             }
             imageCapture: ImageCapture {
                 id: imageCapture
@@ -124,6 +124,18 @@ Page {
                     color: page.arMode && !ar.tracking ? "#ffb74d" : "white"
                     text: page.arMode ? (ar.status || qsTr("Starting ARCore..."))
                                       : qsTr("Walk slowly around the object; keep it centred and overlap each photo by ~70%.")
+                }
+                Label {
+                    visible: ar.crashedLastTime
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: "#ffb74d"
+                    text: ar.status
+                }
+                Button {
+                    visible: ar.crashedLastTime
+                    text: qsTr("Try ARCore again")
+                    onClicked: ar.retryArCore()
                 }
                 Label {
                     visible: page.arMode
