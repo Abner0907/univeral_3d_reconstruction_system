@@ -13,6 +13,7 @@
 
 #ifdef Q_OS_ANDROID
 #include <QCoreApplication>
+#include <QtCore/qcoreapplication_platform.h>
 #include <QJniObject>
 #endif
 

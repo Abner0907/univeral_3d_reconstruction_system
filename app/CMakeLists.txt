@@ -7,6 +7,9 @@ qt_standard_project_setup(REQUIRES 6.5)
 if(QT_KNOWN_POLICY_QTP0004)
     qt_policy(SET QTP0004 NEW)
 endif()
+if(QT_KNOWN_POLICY_QTP0002)
+    qt_policy(SET QTP0002 NEW)
+endif()
 
 qt_add_executable(u3d_app
     src/main.cpp
@@ -80,10 +83,20 @@ if(ANDROID)
         endif()
     endforeach()
     if(_gradle_template)
+        # The template has two "dependencies {" blocks (buildscript and app); the app's is last.
         file(READ "${_gradle_template}" _gradle)
-        string(REGEX REPLACE "dependencies[ \t]*{" "dependencies {\n    implementation 'com.google.ar:core:1.47.0'" _gradle "${_gradle}")
-        file(WRITE "${U3D_ANDROID_PACKAGE_DIR}/build.gradle" "${_gradle}")
-        message(STATUS "Android: build.gradle from ${_gradle_template} + ARCore")
+        string(FIND "${_gradle}" "dependencies {" _deps REVERSE)
+        if(_deps GREATER -1)
+            string(LENGTH "dependencies {" _len)
+            math(EXPR _insert "${_deps} + ${_len}")
+            string(SUBSTRING "${_gradle}" 0 ${_insert} _head)
+            string(SUBSTRING "${_gradle}" ${_insert} -1 _tail)
+            set(_gradle "${_head}\n    implementation 'com.google.ar:core:1.47.0'${_tail}")
+            file(WRITE "${U3D_ANDROID_PACKAGE_DIR}/build.gradle" "${_gradle}")
+            message(STATUS "Android: build.gradle from ${_gradle_template} + ARCore")
+        else()
+            message(WARNING "No dependencies block in ${_gradle_template}: the APK will not include ARCore")
+        endif()
     else()
         message(WARNING "Qt's Android build.gradle template not found: the APK will not include ARCore")
     endif()
@@ -100,10 +113,13 @@ if(ANDROID)
     endif()
 endif()
 
-include(GNUInstallDirs)
-install(TARGETS u3d_app
-    BUNDLE DESTINATION .
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# Desktop install rules (on Android the app is a shared library packaged into the APK).
+if(NOT ANDROID)
+    include(GNUInstallDirs)
+    install(TARGETS u3d_app
+        BUNDLE DESTINATION .
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 if(UNIX AND NOT APPLE AND NOT ANDROID)
     install(FILES packaging/u3d.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
     install(FILES packaging/u3d.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
