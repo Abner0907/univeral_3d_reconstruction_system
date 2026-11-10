@@ -1,7 +1,12 @@
 // u3d_render_check - renders a .ply with the app's SplatView into an offscreen OpenGL texture
 // (QQuickRenderControl, no window) and saves a PNG. Development tool for checking the viewer.
 //
-//   u3d_render_check input.ply output.png [width height] [yaw pitch]
+//   u3d_render_check input.ply output.png [width height] [yaw pitch] [commands...]
+//
+// Commands (applied in order after loading; yaw/pitch "-" keeps the default view):
+//   crop [cropped.ply]   enable cropping with the automatic box (wireframe); optionally save it
+//   preset N             view preset (0 front, 1 side, 2 top, 3 back)
+//   focus X Y            make the splat at item position (X, Y) the orbit centre (double tap)
 
 #include "SplatView.h"
 
@@ -69,11 +74,39 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "load failed: %s\n", qPrintable(view.error()));
         return 1;
     }
-    if (argc > 6) {
+    if (argc > 6 && QString::fromLocal8Bit(argv[5]) != QLatin1String("-")) {
         view.setYaw(float(std::atof(argv[5])));
         view.setPitch(float(std::atof(argv[6])));
     }
-    std::fprintf(stderr, "%d splats\n", view.splatCount());
+    std::fprintf(stderr, "%d splats, orbit centre (%.2f %.2f %.2f), distance %.2f\n", view.splatCount(),
+                 view.target().x(), view.target().y(), view.target().z(), view.distance());
+    for (int i = 7; i < argc; ++i) {
+        const QString cmd = QString::fromLocal8Bit(argv[i]);
+        if (cmd == QLatin1String("crop")) {
+            view.setCropEnabled(true);
+            view.suggestCrop();
+            std::fprintf(stderr, "crop box [%.2f %.2f %.2f] - [%.2f %.2f %.2f], keeps %d of %d\n", view.cropMin().x(),
+                         view.cropMin().y(), view.cropMin().z(), view.cropMax().x(), view.cropMax().y(),
+                         view.cropMax().z(), view.keptCount(), view.splatCount());
+            if (i + 1 < argc && QString::fromLocal8Bit(argv[i + 1]).endsWith(QLatin1String(".ply"))) {
+                QSignalSpy saved(&view, &SplatView::cropSaved);
+                view.saveCropped(QUrl::fromLocalFile(QString::fromLocal8Bit(argv[++i])));
+                if (!saved.wait(60000) || !saved.first().at(0).toBool()) {
+                    std::fprintf(stderr, "saving the crop failed\n");
+                    return 1;
+                }
+                std::fprintf(stderr, "saved %d Gaussians to %s\n", saved.first().at(1).toInt(), argv[i]);
+            }
+        } else if (cmd == QLatin1String("preset") && i + 1 < argc) {
+            view.viewPreset(std::atoi(argv[++i]));
+        } else if (cmd == QLatin1String("focus") && i + 2 < argc) {
+            const double x = std::atof(argv[i + 1]), y = std::atof(argv[i + 2]);
+            i += 2;
+            const bool ok = view.focusAt(x, y);
+            std::fprintf(stderr, "focus at (%.0f, %.0f): %s, orbit centre (%.2f %.2f %.2f)\n", x, y,
+                         ok ? "hit" : "nothing there", view.target().x(), view.target().y(), view.target().z());
+        }
+    }
 
     for (int frame = 0; frame < 2; ++frame) {
         control.polishItems();

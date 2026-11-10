@@ -172,6 +172,10 @@ std::shared_ptr<SplatData> loadSplats(const QString &path, QString *error)
         d->boundsMax = QVector3D(bounds.max[0], bounds.max[1], bounds.max[2]);
         d->suggestedMin = QVector3D(suggested.min[0], suggested.min[1], suggested.min[2]);
         d->suggestedMax = QVector3D(suggested.max[0], suggested.max[1], suggested.max[2]);
+        // Orbit around the object, not the median of everything (background haze and floaters
+        // would pull the centre off the object).
+        d->objectCenter = (d->suggestedMin + d->suggestedMax) * 0.5f;
+        d->objectRadius = std::max(0.5f * (d->suggestedMax - d->suggestedMin).length(), 1e-3f);
     }
     return d;
 }
@@ -230,7 +234,7 @@ public:
         QMatrix4x4 view;
         view.lookAt(m_eye, m_target, QVector3D(0, 1, 0));
         QMatrix4x4 proj;
-        const float fovY = 50.0f;
+        const float fovY = SplatView::kFovY;
         const float nearPlane = std::max(m_distance * 0.005f, 1e-4f);
         proj.perspective(fovY, float(size.width()) / float(std::max(1, size.height())), nearPlane, m_distance * 100.0f);
         const float focal = 0.5f * float(size.height()) / std::tan(qDegreesToRadians(fovY) * 0.5f);
@@ -477,10 +481,17 @@ void SplatView::setPitch(float v)
 
 void SplatView::setDistance(float v)
 {
-    const float r = m_data ? m_data->radius : 1.0f;
-    m_distance = std::clamp(v, r * 0.05f, r * 50.0f);
+    const float r = m_data ? m_data->objectRadius : 1.0f;
+    const float far = m_data ? std::max(m_data->radius, r) : 1.0f;
+    m_distance = std::clamp(v, r * 0.02f, far * 30.0f);
     emit viewChanged();
     update();
+}
+
+QVector3D SplatView::eye() const
+{
+    const float yaw = qDegreesToRadians(m_yaw), pitch = qDegreesToRadians(m_pitch);
+    return m_target + QVector3D(std::cos(pitch) * std::sin(yaw), std::sin(pitch), std::cos(pitch) * std::cos(yaw)) * m_distance;
 }
 
 void SplatView::orbit(qreal dx, qreal dy)
@@ -508,12 +519,82 @@ void SplatView::zoom(qreal factor)
 
 void SplatView::resetView()
 {
-    m_target = m_data ? m_data->center : QVector3D();
-    m_distance = m_data ? m_data->radius * 2.2f : 3.0f;
+    m_target = m_data ? m_data->objectCenter : QVector3D();
+    // The object fills the view: distance = radius / sin(fov / 2), plus some room.
+    m_distance = (m_data ? m_data->objectRadius : 1.0f) / std::sin(qDegreesToRadians(kFovY * 0.5f)) * 0.95f;
     m_yaw = 0.0f;
     m_pitch = 15.0f;
     emit viewChanged();
     update();
+}
+
+void SplatView::centerOnObject()
+{
+    if (m_cropEnabled)
+        m_target = (m_cropMin + m_cropMax) * 0.5f;
+    else
+        m_target = m_data ? m_data->objectCenter : QVector3D();
+    emit viewChanged();
+    update();
+}
+
+void SplatView::viewPreset(int preset)
+{
+    switch (preset) {
+    case 1: m_yaw = 90.0f; m_pitch = 0.0f; break;   // side
+    case 2: m_yaw = 0.0f; m_pitch = 89.0f; break;   // top
+    case 3: m_yaw = 180.0f; m_pitch = 10.0f; break; // back
+    default: m_yaw = 0.0f; m_pitch = 10.0f; break;  // front
+    }
+    centerOnObject();
+}
+
+bool SplatView::focusAt(qreal x, qreal y)
+{
+    if (!m_data || width() <= 0 || height() <= 0)
+        return false;
+    QMatrix4x4 view;
+    view.lookAt(eye(), m_target, QVector3D(0, 1, 0));
+    QMatrix4x4 proj;
+    proj.perspective(kFovY, float(width() / height()), std::max(m_distance * 0.005f, 1e-4f), m_distance * 100.0f);
+    const QMatrix4x4 mvp = proj * view;
+    // Nearest reasonably opaque splat within a finger-sized radius of the tap.
+    const float radius = 24.0f;
+    const unsigned char minAlpha = 64;
+    float bestDepth = std::numeric_limits<float>::max();
+    int best = -1;
+    const std::size_t n = m_data->size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (m_data->colors[i * 4 + 3] < minAlpha)
+            continue;
+        const QVector3D c(m_data->centers[i * 3], m_data->centers[i * 3 + 1], m_data->centers[i * 3 + 2]);
+        if (m_cropEnabled && (c.x() < m_cropMin.x() || c.y() < m_cropMin.y() || c.z() < m_cropMin.z()
+                              || c.x() > m_cropMax.x() || c.y() > m_cropMax.y() || c.z() > m_cropMax.z()))
+            continue;
+        const QVector4D clip = mvp * QVector4D(c, 1.0f);
+        if (clip.w() <= 1e-6f)
+            continue;
+        const float sx = (clip.x() / clip.w() * 0.5f + 0.5f) * float(width());
+        const float sy = (0.5f - clip.y() / clip.w() * 0.5f) * float(height());
+        const float dx = sx - float(x), dy = sy - float(y);
+        if (dx * dx + dy * dy <= radius * radius && clip.w() < bestDepth) {
+            bestDepth = clip.w();
+            best = int(i);
+        }
+    }
+    if (best < 0)
+        return false;
+    // Keep the camera where it is and turn it towards the new centre.
+    const QVector3D camera = eye();
+    m_target = QVector3D(m_data->centers[std::size_t(best) * 3], m_data->centers[std::size_t(best) * 3 + 1],
+                         m_data->centers[std::size_t(best) * 3 + 2]);
+    const QVector3D offset = camera - m_target;
+    m_distance = std::max(offset.length(), 1e-4f);
+    m_pitch = std::clamp(qRadiansToDegrees(std::asin(std::clamp(offset.y() / m_distance, -1.0f, 1.0f))), -89.0f, 89.0f);
+    m_yaw = qRadiansToDegrees(std::atan2(offset.x(), offset.z()));
+    emit viewChanged();
+    update();
+    return true;
 }
 
 // ----------------------------------------------------------------------------- cropping

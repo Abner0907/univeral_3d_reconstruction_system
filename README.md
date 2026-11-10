@@ -36,13 +36,14 @@ is its reference implementation.
 
 ## Using the app (Android)
 
-1. **New scan.** Walk slowly around the object.
-   - With **ARCore** (most recent phones): keep **Auto** on. A keyframe is saved whenever you
-     have moved about 7 cm or turned about 7°, together with the tracked camera pose and
-     feature points.
-   - Without ARCore, or with the ARCore switch off: the camera takes a photo every second in
-     Auto mode, or when you tap the shutter.
-   - Or use **Import photos** to pick 30–200 overlapping photos from the gallery.
+1. **New scan.** The normal camera starts immediately. Walk slowly around the object; with
+   **Auto** on, a photo is taken every second (or tap the shutter). You can also use
+   **Import photos** to pick 30–200 overlapping photos from the gallery.
+   - **ARCore** (optional): on phones where Google Play Services for AR is available, an
+     **ARCore** switch appears in the capture toolbar. With it on, each photo also records the
+     tracked camera pose and feature points (Auto then saves a keyframe every ~7 cm / 7°), and
+     reconstruction can skip structure-from-motion. If ARCore fails or delivers no camera
+     images, the app switches back to the normal camera by itself.
 2. **Reconstruct.** Choose a quality preset. Everything runs on the phone and the screen stays
    on meanwhile:
 
@@ -52,8 +53,13 @@ is its reference implementation.
    | Balanced | 4000 | 480 px | 150 k |
    | High | 7000 | 640 px | 300 k |
 
-3. **View** the model: one finger orbits, two fingers pan, pinch zooms. **Export .ply** to share
-   it.
+3. **View** the model: one finger orbits, two fingers pan, pinch zooms.
+4. **Crop** (viewer toolbar) to keep only the object: X / Y / Z range sliders define a box
+   (drawn as a wireframe; everything outside is hidden live), **Remove faint** drops nearly
+   transparent splats, and **Auto** fits the box around the main object, ignoring background
+   and floaters. **Apply** saves the cropped model; the original is kept and **Restore
+   original** brings it back.
+5. **Export .ply** to share it.
 
 Capture tips: keep the lighting even, avoid motion blur, overlap neighbouring photos by about
 70 %, and prefer textured surfaces (plain white walls and reflective or transparent objects

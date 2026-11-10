@@ -10,6 +10,7 @@ Page {
     property url source
     property string projectPath // set when the model belongs to a scan (crop saves in place)
     property int cropRevision: 0 // bumped after each save so bindings re-check the backup
+    property bool moveMode: false // one-finger drag moves instead of rotating
 
     header: ToolBar {
         RowLayout {
@@ -44,16 +45,23 @@ Page {
         anchors.fill: parent
         source: page.source
 
-        // One finger / left mouse: orbit.  Two fingers / right mouse: pan.  Pinch / wheel: zoom.
+        // One finger / left mouse: rotate around the orbit centre (or move, in Move mode).
+        // Two fingers: move + pinch zoom.  Right / middle mouse: move.  Wheel: zoom.
+        // Double tap / double click: make the tapped spot the orbit centre.
         DragHandler {
-            id: orbitDrag
+            id: oneFinger
             target: null
             acceptedButtons: Qt.LeftButton
+            minimumPointCount: 1
             maximumPointCount: 1
             property point last
             onActiveChanged: last = Qt.point(0, 0)
             onActiveTranslationChanged: {
-                view.orbit(activeTranslation.x - last.x, activeTranslation.y - last.y)
+                const dx = activeTranslation.x - last.x, dy = activeTranslation.y - last.y
+                if (page.moveMode)
+                    view.pan(dx, dy)
+                else
+                    view.orbit(dx, dy)
                 last = Qt.point(activeTranslation.x, activeTranslation.y)
             }
         }
@@ -69,10 +77,17 @@ Page {
         }
         PinchHandler {
             target: null
+            minimumPointCount: 2
+            maximumPointCount: 2
             property real lastScale: 1
             property point lastCentroid
-            onActiveChanged: { lastScale = 1; lastCentroid = centroid.position }
+            onActiveChanged: {
+                lastScale = 1
+                lastCentroid = centroid.position
+            }
             onActiveScaleChanged: {
+                if (!active)
+                    return
                 view.zoom(activeScale / lastScale)
                 lastScale = activeScale
             }
@@ -81,6 +96,14 @@ Page {
                     return
                 view.pan(centroid.position.x - lastCentroid.x, centroid.position.y - lastCentroid.y)
                 lastCentroid = centroid.position
+            }
+        }
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onDoubleTapped: (eventPoint) => {
+                hint.text = view.focusAt(eventPoint.position.x, eventPoint.position.y)
+                            ? qsTr("Rotation centre set") : qsTr("Nothing there - double-tap on the model")
+                hintTimer.restart()
             }
         }
         WheelHandler {
@@ -112,8 +135,43 @@ Page {
         opacity: 0.7
         font.pixelSize: 12
         text: (view.isSplat ? qsTr("%1 Gaussians") : qsTr("%1 points")).arg(view.splatCount.toLocaleString(Qt.locale(), 'f', 0))
-              + (AppInfo.isMobile ? "" : qsTr("  ·  drag: orbit  ·  right-drag: pan  ·  wheel: zoom"))
+              + (AppInfo.isMobile ? qsTr("  ·  double-tap: set rotation centre")
+                                   : qsTr("  ·  drag: rotate  ·  right-drag: move  ·  wheel: zoom  ·  double-click: set rotation centre"))
     }
+
+    // ------------------------------------------------------------------ view controls
+    ColumnLayout {
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: 8
+        spacing: 4
+        visible: view.splatCount > 0
+
+        Button {
+            text: page.moveMode ? qsTr("Move") : qsTr("Rotate")
+            checkable: true
+            checked: page.moveMode
+            onClicked: page.moveMode = checked
+            Layout.fillWidth: true
+            ToolTip.visible: hovered
+            ToolTip.text: qsTr("What dragging with one finger does")
+        }
+        Button { text: qsTr("Center"); flat: true; Layout.fillWidth: true; onClicked: view.centerOnObject() }
+        Button { text: qsTr("Front"); flat: true; Layout.fillWidth: true; onClicked: view.viewPreset(0) }
+        Button { text: qsTr("Side"); flat: true; Layout.fillWidth: true; onClicked: view.viewPreset(1) }
+        Button { text: qsTr("Top"); flat: true; Layout.fillWidth: true; onClicked: view.viewPreset(2) }
+    }
+
+    Label {
+        id: hint
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: 12
+        padding: 8
+        visible: hintTimer.running
+        background: Rectangle { color: "#b0000000"; radius: 6 }
+    }
+    Timer { id: hintTimer; interval: 1800 }
 
     // ------------------------------------------------------------------ cropping
     FileDialog {

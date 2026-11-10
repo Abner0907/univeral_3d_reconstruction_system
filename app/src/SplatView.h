@@ -18,6 +18,8 @@ struct SplatData {
     float radius = 1.0f;                 // robust scene radius
     QVector3D boundsMin, boundsMax;      // range of the crop sliders (bulk of the model)
     QVector3D suggestedMin, suggestedMax; // automatic crop box around the main object
+    QVector3D objectCenter;              // centre of the main object (orbit centre)
+    float objectRadius = 1.0f;           // its radius (initial framing, zoom limits)
     bool isSplat = true;                 // false: loaded from a plain point cloud
     std::size_t size() const { return centers.size() / 3; }
 };
@@ -92,12 +94,23 @@ public:
     Q_INVOKABLE void orbit(qreal dx, qreal dy);
     Q_INVOKABLE void pan(qreal dx, qreal dy);
     Q_INVOKABLE void zoom(qreal factor);
+    // Frames the main object from the front (orbit centre = object centre).
     Q_INVOKABLE void resetView();
+    // Moves the orbit centre back to the object (or the crop box) without changing the angle.
+    Q_INVOKABLE void centerOnObject();
+    // 0 = front, 1 = side, 2 = top, 3 = back.
+    Q_INVOKABLE void viewPreset(int preset);
+    // Makes the splat under item position (x, y) the orbit centre. Returns false if nothing
+    // is there.
+    Q_INVOKABLE bool focusAt(qreal x, qreal y);
 
     // Renderer access.
     std::shared_ptr<const SplatData> data() const { return m_data; }
     int dataVersion() const { return m_dataVersion; }
     QVector3D target() const { return m_target; }
+    // Camera shared by the renderer and picking.
+    QVector3D eye() const;
+    static constexpr float kFovY = 50.0f;
 
 signals:
     void sourceChanged();
