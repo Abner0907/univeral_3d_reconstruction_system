@@ -78,5 +78,6 @@ private:
     bool m_ready = false;
     bool m_crashedLastTime = false;
     bool m_starting = false;
+    int m_checkAttempts = 0;
     ArCoreSession *m_session = nullptr;
 };

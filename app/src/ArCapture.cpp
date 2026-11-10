@@ -63,6 +63,7 @@ ArCapture::ArCapture(QObject *parent)
 ArCapture::~ArCapture()
 {
     stop();
+    setGuard(false); // closed normally (a crash never gets here, so the guard survives one)
 }
 
 QQuickImageProvider *ArCapture::createImageProvider()
@@ -99,6 +100,7 @@ void ArCapture::setAutoCapture(bool on)
 
 void ArCapture::retryArCore()
 {
+    m_checkAttempts = 0;
     m_crashedLastTime = false;
     m_ready = false;
     setStatus(QString());
@@ -114,8 +116,10 @@ void ArCapture::checkAvailability()
     setGuard(true);
     ArCoreSession::checkAvailabilityAsync(this, [this](ArCoreSession::Availability availability) {
         setGuard(false);
-        if (availability == ArCoreSession::Availability::Checking) {
-            // The first check runs asynchronously inside ARCore; ask again shortly.
+        if (availability == ArCoreSession::Availability::Checking && ++m_checkAttempts < 10) {
+            // The first check runs asynchronously inside ARCore; ask again shortly. Without
+            // Google Play Services (e.g. many phones sold in China) it never finishes, so give
+            // up after ~5 s - the normal camera does not depend on this check.
             QTimer::singleShot(500, this, &ArCapture::checkAvailability);
             return;
         }

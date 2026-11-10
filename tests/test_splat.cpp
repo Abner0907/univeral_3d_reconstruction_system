@@ -2,6 +2,7 @@
 
 #include "Test.h"
 
+#include "u3d/splat/Crop.h"
 #include "u3d/splat/Loss.h"
 #include "u3d/splat/Rasterizer.h"
 #include "u3d/splat/SplatPly.h"
@@ -294,4 +295,51 @@ TEST(ply_round_trip)
     CHECK(r.size() == 4);
     std::remove(path.c_str());
     std::remove("u3d_test_points.ply");
+}
+
+TEST(crop_keeps_the_object_and_removes_background)
+{
+    // An opaque object in [-0.5, 0.5]^3, a ring of background splats far around it, a few
+    // stray floaters further out, and faint Gaussians inside the object.
+    std::mt19937 rng(21);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    GaussianModel m;
+    auto add = [&](float x, float y, float z, float opacity) {
+        GaussianModel one;
+        one.resize(1);
+        one.means = {x, y, z};
+        one.scales = {-4, -4, -4};
+        one.quats = {1, 0, 0, 0};
+        one.opacities = {logit(opacity)};
+        one.colors = {0, 0, 0};
+        m.appendFrom(one, 0);
+    };
+    for (int i = 0; i < 2000; ++i)
+        add(0.5f * u(rng), 0.5f * u(rng), 0.5f * u(rng), 0.9f);
+    for (int i = 0; i < 200; ++i) {
+        const float a = 3.14159f * u(rng);
+        add(3.0f * std::cos(a), 0.3f * u(rng), 3.0f * std::sin(a), 0.9f); // background ring
+    }
+    for (int i = 0; i < 5; ++i)
+        add(20.0f + u(rng), 15.0f, -30.0f, 0.9f); // a few far floaters (0.2 %)
+    for (int i = 0; i < 100; ++i)
+        add(0.2f * u(rng), 0.2f * u(rng), 0.2f * u(rng), 0.01f); // faint
+
+    const CropBox box = suggestCropBox(m);
+    LOG("suggested box: [%.2f %.2f %.2f] - [%.2f %.2f %.2f]", box.min[0], box.min[1], box.min[2], box.max[0],
+        box.max[1], box.max[2]);
+    for (int k = 0; k < 3; ++k) {
+        CHECK(box.min[k] < -0.4f && box.min[k] > -1.0f); // hugs the object, excludes the ring
+        CHECK(box.max[k] > 0.4f && box.max[k] < 1.0f);
+    }
+
+    const GaussianModel cropped = cropModel(m, box, 0.05f);
+    LOG("%zu -> %zu Gaussians", m.size(), cropped.size());
+    CHECK(cropped.size() >= 1900 && cropped.size() <= 2000); // object kept, faint ones removed
+    for (std::size_t i = 0; i < cropped.size(); ++i)
+        CHECK(box.contains(&cropped.means[i * 3]));
+
+    // The slider range ignores the far floaters but still covers the background ring.
+    const CropBox bounds = modelBounds(m);
+    CHECK(bounds.max[0] > 2.9f && bounds.max[0] < 15.0f);
 }

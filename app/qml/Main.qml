@@ -26,7 +26,10 @@ ApplicationWindow {
     function openProject(path) { stack.push(projectPage, { projectPath: path }) }
     function openCapture(path) { stack.push(capturePage, { projectPath: path }) }
     function openReconstruct(path) { stack.push(reconstructPage, { projectPath: path }) }
-    function openViewer(url, title) { stack.push(viewerPage, { source: url, title: title }) }
+    // projectPath (optional): the scan the model belongs to - enables cropping it in place.
+    function openViewer(url, title, projectPath) {
+        stack.push(viewerPage, { source: url, title: title, projectPath: projectPath || "" })
+    }
 
     StackView {
         id: stack

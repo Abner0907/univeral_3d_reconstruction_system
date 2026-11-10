@@ -1,6 +1,6 @@
 set(U3D_TEST_SOURCES TestMain.cpp test_splat.cpp)
 set(U3D_TEST_LIBS u3d_splat)
-set(U3D_TEST_NAMES splat_gradients splat_projection ssim_loss training_recovers ply_round_trip)
+set(U3D_TEST_NAMES splat_gradients splat_projection ssim_loss training_recovers ply_round_trip crop)
 
 if(U3D_WITH_SFM)
     list(APPEND U3D_TEST_SOURCES test_sfm.cpp test_pipeline.cpp)

@@ -10,6 +10,7 @@ add_library(u3d_splat STATIC
     src/splat/Adam.cpp
     src/splat/Trainer.cpp
     src/splat/SplatPly.cpp
+    src/splat/Crop.cpp
 )
 target_include_directories(u3d_splat PUBLIC include)
 target_link_libraries(u3d_splat PUBLIC Threads::Threads)

@@ -48,6 +48,11 @@ public:
     Q_INVOKABLE QString nextImagePath(const QString &path) const;
     Q_INVOKABLE QVariantMap info(const QString &path) const;
     Q_INVOKABLE QUrl resultUrl(const QString &path) const;
+    // Before the first crop: keep the uncropped model as output/splat_full.ply.
+    Q_INVOKABLE bool backupResult(const QString &path);
+    Q_INVOKABLE bool hasFullBackup(const QString &path) const;
+    // Puts the uncropped model back as output/splat.ply.
+    Q_INVOKABLE bool restoreFullResult(const QString &path);
 
 signals:
     void countChanged();

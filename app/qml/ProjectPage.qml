@@ -111,7 +111,7 @@ Page {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 56
                 enabled: page.info.hasResult || (AppInfo.canReconstruct && page.info.imageCount >= 3)
-                onClicked: page.info.hasResult ? window.openViewer(page.info.resultUrl, page.info.name)
+                onClicked: page.info.hasResult ? window.openViewer(page.info.resultUrl, page.info.name, page.projectPath)
                                                : window.openReconstruct(page.projectPath)
             }
             Button {

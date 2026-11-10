@@ -16,6 +16,8 @@ struct SplatData {
     std::vector<float> covariances;      // 6 per splat: xx xy xz yy yz zz
     QVector3D center;                    // robust scene centre
     float radius = 1.0f;                 // robust scene radius
+    QVector3D boundsMin, boundsMax;      // range of the crop sliders (bulk of the model)
+    QVector3D suggestedMin, suggestedMax; // automatic crop box around the main object
     bool isSplat = true;                 // false: loaded from a plain point cloud
     std::size_t size() const { return centers.size() / 3; }
 };
@@ -36,6 +38,17 @@ class SplatView : public QQuickFramebufferObject
     Q_PROPERTY(float pitch READ pitch WRITE setPitch NOTIFY viewChanged)
     Q_PROPERTY(float distance READ distance WRITE setDistance NOTIFY viewChanged)
 
+    // Cropping: splats outside [cropMin, cropMax] or fainter than minOpacity are hidden while
+    // cropEnabled, and removed by saveCropped().
+    Q_PROPERTY(bool cropEnabled READ cropEnabled WRITE setCropEnabled NOTIFY cropChanged)
+    Q_PROPERTY(QVector3D cropMin READ cropMin WRITE setCropMin NOTIFY cropChanged)
+    Q_PROPERTY(QVector3D cropMax READ cropMax WRITE setCropMax NOTIFY cropChanged)
+    Q_PROPERTY(float minOpacity READ minOpacity WRITE setMinOpacity NOTIFY cropChanged)
+    Q_PROPERTY(int keptCount READ keptCount NOTIFY cropChanged)
+    Q_PROPERTY(QVector3D boundsMin READ boundsMin NOTIFY loaded)
+    Q_PROPERTY(QVector3D boundsMax READ boundsMax NOTIFY loaded)
+    Q_PROPERTY(bool saving READ saving NOTIFY savingChanged)
+
 public:
     explicit SplatView(QQuickItem *parent = nullptr);
     Renderer *createRenderer() const override;
@@ -54,6 +67,27 @@ public:
     void setPitch(float v);
     void setDistance(float v);
 
+    bool cropEnabled() const { return m_cropEnabled; }
+    QVector3D cropMin() const { return m_cropMin; }
+    QVector3D cropMax() const { return m_cropMax; }
+    float minOpacity() const { return m_minOpacity; }
+    int keptCount() const { return m_keptCount; }
+    QVector3D boundsMin() const { return m_data ? m_data->boundsMin : QVector3D(-1, -1, -1); }
+    QVector3D boundsMax() const { return m_data ? m_data->boundsMax : QVector3D(1, 1, 1); }
+    bool saving() const { return m_saving; }
+    void setCropEnabled(bool on);
+    void setCropMin(const QVector3D &v);
+    void setCropMax(const QVector3D &v);
+    void setMinOpacity(float v);
+
+    // Sets the crop box around the main object (ignoring background and floaters).
+    Q_INVOKABLE void suggestCrop();
+    // Writes the cropped model (re-read from `source` at full precision) to `target`; emits
+    // cropSaved when done. Saving over the source file is allowed.
+    Q_INVOKABLE void saveCropped(const QUrl &target);
+    // Reloads `source` from disk (e.g. after it was overwritten by saveCropped).
+    Q_INVOKABLE void reload();
+
     // Gestures (pixels of finger/mouse movement).
     Q_INVOKABLE void orbit(qreal dx, qreal dy);
     Q_INVOKABLE void pan(qreal dx, qreal dy);
@@ -70,6 +104,9 @@ signals:
     void loadingChanged();
     void loaded();
     void viewChanged();
+    void cropChanged();
+    void savingChanged();
+    void cropSaved(bool ok, int count, const QString &error);
 
 private:
     QUrl m_source;
@@ -83,4 +120,11 @@ private:
     QVector3D m_target;
     QFutureWatcher<std::shared_ptr<SplatData>> m_watcher;
     QString m_pendingError;
+    void updateKeptCount();
+    bool m_cropEnabled = false;
+    QVector3D m_cropMin{-1, -1, -1};
+    QVector3D m_cropMax{1, 1, 1};
+    float m_minOpacity = 0.0f;
+    int m_keptCount = 0;
+    bool m_saving = false;
 };

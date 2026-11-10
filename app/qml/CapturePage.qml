@@ -7,9 +7,10 @@ import QtMultimedia
 import U3D
 
 // Two capture modes:
-//  - ARCore (preferred): tracked camera poses + feature points are recorded with every photo,
-//    so reconstruction skips structure-from-motion. Auto mode takes a photo every ~7 cm / 7°.
-//  - Plain camera (Qt Multimedia): photos only; poses are estimated later from the images.
+//  - Normal camera (Qt Multimedia, default): photos only; poses are estimated later from the
+//    images. Starts immediately and never waits for ARCore.
+//  - ARCore (opt-in switch, shown once ARCore is confirmed available): tracked camera poses +
+//    feature points are recorded with every photo. Auto takes a photo every ~7 cm / 7°.
 Page {
     id: page
     property string projectPath
@@ -38,9 +39,17 @@ Page {
     onArModeChanged: updateSession()
     function updateSession() {
         if (arMode && permissionGranted && !ar.running)
-            ar.start(projectPath)
-        else if (!arMode && ar.running)
-            ar.stop()
+            arStartDelay.restart() // let the normal camera release the hardware first
+        else if (!arMode) {
+            arStartDelay.stop()
+            if (ar.running)
+                ar.stop()
+        }
+    }
+    Timer {
+        id: arStartDelay
+        interval: 600
+        onTriggered: if (page.arMode && page.permissionGranted && !ar.running) ar.start(page.projectPath)
     }
     Connections {
         target: ar
@@ -65,7 +74,7 @@ Page {
             Switch {
                 id: arSwitch
                 visible: ar.available
-                checked: true
+                checked: false
                 text: qsTr("ARCore")
             }
         }
@@ -89,7 +98,7 @@ Page {
         CaptureSession {
             camera: Camera {
                 id: camera
-                active: ar.ready && !page.arMode && cameraPermission.status === Qt.PermissionStatus.Granted
+                active: !page.arMode && page.permissionGranted
             }
             imageCapture: ImageCapture {
                 id: imageCapture
@@ -113,7 +122,6 @@ Page {
             color: "white"
             visible: page.arMode ? ar.previewRevision === 0 : !camera.active || !imageCapture.readyForCapture
             text: !page.permissionGranted ? qsTr("Waiting for camera permission...")
-                  : !ar.ready ? qsTr("Checking ARCore...")
                   : page.arMode ? qsTr("Starting ARCore camera...")
                   : qsTr("Starting camera...")
         }

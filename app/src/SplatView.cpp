@@ -1,5 +1,6 @@
 #include "SplatView.h"
 
+#include "u3d/splat/Crop.h"
 #include "u3d/splat/SplatPly.h"
 
 #include <QMatrix4x4>
@@ -32,9 +33,20 @@ uniform mat4 u_view;
 uniform mat4 u_proj;
 uniform vec2 u_focal;    // pixels
 uniform vec2 u_viewport; // pixels
+uniform int u_cropEnabled;
+uniform vec3 u_cropMin;
+uniform vec3 u_cropMax;
+uniform float u_minOpacity;
 out vec4 v_color;
 out vec2 v_pos;
 void main() {
+    if (u_cropEnabled != 0 && (any(lessThan(a_center, u_cropMin)) || any(greaterThan(a_center, u_cropMax))
+                               || a_color.a < u_minOpacity)) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0); // cropped away
+        v_color = vec4(0.0);
+        v_pos = vec2(0.0);
+        return;
+    }
     vec4 cam = u_view * vec4(a_center, 1.0);
     vec4 clip = u_proj * cam;
     float limit = 1.2 * clip.w;
@@ -82,6 +94,17 @@ void main() {
     float B = exp(A) * v_color.a;
     fragColor = vec4(B * v_color.rgb, B); // premultiplied, composited front to back
 }
+)";
+
+// Crop-box wireframe.
+const char *kLineVertexShader = R"(
+layout(location = 0) in vec3 a_pos;
+uniform mat4 u_mvp;
+void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }
+)";
+const char *kLineFragmentShader = R"(
+out vec4 fragColor;
+void main() { fragColor = vec4(0.31, 0.76, 0.97, 1.0); }
 )";
 
 struct PackedSplat {
@@ -143,6 +166,12 @@ std::shared_ptr<SplatData> loadSplats(const QString &path, QString *error)
             dist[i] = (QVector3D(d->centers[i * 3], d->centers[i * 3 + 1], d->centers[i * 3 + 2]) - d->center).length();
         std::nth_element(dist.begin(), dist.begin() + std::ptrdiff_t(n * 8 / 10), dist.end());
         d->radius = std::max(dist[n * 8 / 10], 1e-3f);
+        const u3d::CropBox bounds = u3d::modelBounds(m);
+        const u3d::CropBox suggested = u3d::suggestCropBox(m);
+        d->boundsMin = QVector3D(bounds.min[0], bounds.min[1], bounds.min[2]);
+        d->boundsMax = QVector3D(bounds.max[0], bounds.max[1], bounds.max[2]);
+        d->suggestedMin = QVector3D(suggested.min[0], suggested.min[1], suggested.min[2]);
+        d->suggestedMax = QVector3D(suggested.max[0], suggested.max[1], suggested.max[2]);
     }
     return d;
 }
@@ -153,6 +182,8 @@ public:
     SplatRenderer() = default;
     ~SplatRenderer() override
     {
+        m_lineBuffer.destroy();
+        m_lineVao.destroy();
         m_instances.destroy();
         m_corners.destroy();
         m_vao.destroy();
@@ -178,6 +209,10 @@ public:
         m_target = view->target();
         m_eye = m_target + offset * view->distance();
         m_distance = view->distance();
+        m_cropEnabled = view->cropEnabled();
+        m_cropMin = view->cropMin();
+        m_cropMax = view->cropMax();
+        m_minOpacity = view->minOpacity();
     }
 
     void render() override
@@ -211,14 +246,44 @@ public:
         m_program.setUniformValue("u_proj", proj);
         m_program.setUniformValue("u_focal", QVector2D(focal, focal));
         m_program.setUniformValue("u_viewport", QVector2D(float(size.width()), float(size.height())));
+        m_program.setUniformValue("u_cropEnabled", m_cropEnabled ? 1 : 0);
+        m_program.setUniformValue("u_cropMin", m_cropMin);
+        m_program.setUniformValue("u_cropMax", m_cropMax);
+        m_program.setUniformValue("u_minOpacity", m_minOpacity);
         m_vao.bind();
         glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, GLsizei(m_data->size()));
         m_vao.release();
         m_program.release();
+        if (m_cropEnabled)
+            drawCropBox(proj * view);
         QQuickOpenGLUtils::resetOpenGLState();
     }
 
 private:
+    void drawCropBox(const QMatrix4x4 &mvp)
+    {
+        const QVector3D a = m_cropMin, b = m_cropMax;
+        const QVector3D c[8] = {{a.x(), a.y(), a.z()}, {b.x(), a.y(), a.z()}, {b.x(), b.y(), a.z()}, {a.x(), b.y(), a.z()},
+                                {a.x(), a.y(), b.z()}, {b.x(), a.y(), b.z()}, {b.x(), b.y(), b.z()}, {a.x(), b.y(), b.z()}};
+        const int edges[24] = {0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7};
+        float lines[24 * 3];
+        for (int k = 0; k < 24; ++k) {
+            lines[k * 3] = c[edges[k]].x();
+            lines[k * 3 + 1] = c[edges[k]].y();
+            lines[k * 3 + 2] = c[edges[k]].z();
+        }
+        glDisable(GL_BLEND);
+        m_lineProgram.bind();
+        m_lineProgram.setUniformValue("u_mvp", mvp);
+        m_lineVao.bind();
+        m_lineBuffer.bind();
+        m_lineBuffer.allocate(lines, sizeof lines);
+        glDrawArrays(GL_LINES, 0, 24);
+        m_lineBuffer.release();
+        m_lineVao.release();
+        m_lineProgram.release();
+    }
+
     void initialize()
     {
         initializeOpenGLFunctions();
@@ -232,6 +297,20 @@ private:
         m_program.addShaderFromSourceCode(QOpenGLShader::Fragment, header + kFragmentShader);
         if (!m_program.link())
             qWarning("Splat shader: %s", qPrintable(m_program.log()));
+        m_lineProgram.addShaderFromSourceCode(QOpenGLShader::Vertex, header + kLineVertexShader);
+        m_lineProgram.addShaderFromSourceCode(QOpenGLShader::Fragment, header + kLineFragmentShader);
+        if (!m_lineProgram.link())
+            qWarning("Crop box shader: %s", qPrintable(m_lineProgram.log()));
+        m_lineVao.create();
+        m_lineVao.bind();
+        m_lineBuffer.create();
+        m_lineBuffer.setUsagePattern(QOpenGLBuffer::DynamicDraw);
+        m_lineBuffer.bind();
+        m_lineBuffer.allocate(24 * 3 * int(sizeof(float)));
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        m_lineBuffer.release();
+        m_lineVao.release();
 
         m_vao.create();
         m_vao.bind();
@@ -312,6 +391,12 @@ private:
     }
 
     bool m_initialized = false;
+    bool m_cropEnabled = false;
+    QVector3D m_cropMin, m_cropMax;
+    float m_minOpacity = 0.0f;
+    QOpenGLShaderProgram m_lineProgram;
+    QOpenGLVertexArrayObject m_lineVao;
+    QOpenGLBuffer m_lineBuffer{QOpenGLBuffer::VertexBuffer};
     QOpenGLShaderProgram m_program;
     QOpenGLVertexArrayObject m_vao;
     QOpenGLBuffer m_corners{QOpenGLBuffer::VertexBuffer};
@@ -339,6 +424,12 @@ SplatView::SplatView(QQuickItem *parent)
         m_data = data;
         ++m_dataVersion;
         m_loading = false;
+        if (m_data) {
+            m_cropMin = m_data->suggestedMin;
+            m_cropMax = m_data->suggestedMax;
+        }
+        updateKeptCount();
+        emit cropChanged();
         resetView();
         emit loadingChanged();
         emit loaded();
@@ -423,4 +514,112 @@ void SplatView::resetView()
     m_pitch = 15.0f;
     emit viewChanged();
     update();
+}
+
+// ----------------------------------------------------------------------------- cropping
+
+void SplatView::updateKeptCount()
+{
+    int kept = 0;
+    if (m_data) {
+        const std::size_t n = m_data->size();
+        const unsigned char minAlpha = static_cast<unsigned char>(std::lround(std::clamp(m_minOpacity, 0.0f, 1.0f) * 255.0f));
+        for (std::size_t i = 0; i < n; ++i) {
+            const float *c = &m_data->centers[i * 3];
+            if (c[0] >= m_cropMin.x() && c[0] <= m_cropMax.x() && c[1] >= m_cropMin.y() && c[1] <= m_cropMax.y()
+                && c[2] >= m_cropMin.z() && c[2] <= m_cropMax.z() && m_data->colors[i * 4 + 3] >= minAlpha)
+                ++kept;
+        }
+    }
+    m_keptCount = kept;
+}
+
+void SplatView::setCropEnabled(bool on)
+{
+    if (on == m_cropEnabled)
+        return;
+    m_cropEnabled = on;
+    emit cropChanged();
+    update();
+}
+
+void SplatView::setCropMin(const QVector3D &v)
+{
+    m_cropMin = v;
+    updateKeptCount();
+    emit cropChanged();
+    update();
+}
+
+void SplatView::setCropMax(const QVector3D &v)
+{
+    m_cropMax = v;
+    updateKeptCount();
+    emit cropChanged();
+    update();
+}
+
+void SplatView::setMinOpacity(float v)
+{
+    m_minOpacity = std::clamp(v, 0.0f, 1.0f);
+    updateKeptCount();
+    emit cropChanged();
+    update();
+}
+
+void SplatView::suggestCrop()
+{
+    if (!m_data)
+        return;
+    m_cropMin = m_data->suggestedMin;
+    m_cropMax = m_data->suggestedMax;
+    updateKeptCount();
+    emit cropChanged();
+    update();
+}
+
+void SplatView::reload()
+{
+    const QUrl url = m_source;
+    m_source.clear();
+    setSource(url);
+}
+
+void SplatView::saveCropped(const QUrl &target)
+{
+    if (m_saving || m_source.isEmpty())
+        return;
+    m_saving = true;
+    emit savingChanged();
+    const std::string src = (m_source.isLocalFile() ? m_source.toLocalFile() : m_source.toString()).toStdString();
+    const std::string dst = (target.isLocalFile() ? target.toLocalFile() : target.toString()).toStdString();
+    u3d::CropBox box;
+    for (int k = 0; k < 3; ++k) {
+        box.min[k] = m_cropMin[k];
+        box.max[k] = m_cropMax[k];
+    }
+    const float minOpacity = m_minOpacity;
+    auto *watcher = new QFutureWatcher<QString>(this);
+    auto count = std::make_shared<int>(0);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, count] {
+        const QString error = watcher->result();
+        watcher->deleteLater();
+        m_saving = false;
+        emit savingChanged();
+        emit cropSaved(error.isEmpty(), *count, error);
+    });
+    watcher->setFuture(QtConcurrent::run([src, dst, box, minOpacity, count]() -> QString {
+        u3d::GaussianModel model;
+        std::string err;
+        bool isSplat = true;
+        if (!u3d::readSplatPly(src, model, &err, &isSplat))
+            return QString::fromStdString(err);
+        const u3d::GaussianModel cropped = u3d::cropModel(model, box, minOpacity);
+        if (cropped.size() == 0)
+            return QObject::tr("The crop box contains nothing.");
+        if (!u3d::writeSplatPly(dst, cropped, &err))
+            return QString::fromStdString(err);
+        *count = int(cropped.size());
+        return QString();
+    }));
 }

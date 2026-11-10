@@ -224,3 +224,28 @@ QUrl ProjectModel::resultUrl(const QString &path) const
     const QString ply = QDir(path).filePath(QStringLiteral("output/splat.ply"));
     return QFileInfo::exists(ply) ? QUrl::fromLocalFile(ply) : QUrl();
 }
+
+bool ProjectModel::backupResult(const QString &path)
+{
+    const QString full = QDir(path).filePath(QStringLiteral("output/splat_full.ply"));
+    if (QFileInfo::exists(full))
+        return true; // keep the original from the first crop
+    return QFile::copy(QDir(path).filePath(QStringLiteral("output/splat.ply")), full);
+}
+
+bool ProjectModel::hasFullBackup(const QString &path) const
+{
+    return QFileInfo::exists(QDir(path).filePath(QStringLiteral("output/splat_full.ply")));
+}
+
+bool ProjectModel::restoreFullResult(const QString &path)
+{
+    const QString full = QDir(path).filePath(QStringLiteral("output/splat_full.ply"));
+    const QString result = QDir(path).filePath(QStringLiteral("output/splat.ply"));
+    if (!QFileInfo::exists(full))
+        return false;
+    QFile::remove(result);
+    const bool ok = QFile::copy(full, result);
+    refresh();
+    return ok;
+}

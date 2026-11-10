@@ -102,7 +102,7 @@ Page {
                     text: qsTr("View 3D model")
                     highlighted: true
                     Layout.fillWidth: true
-                    onClicked: page.StackView.view.replace(viewerPage, { source: page.job.resultUrl, title: page.info.name })
+                    onClicked: page.StackView.view.replace(viewerPage, { source: page.job.resultUrl, title: page.info.name, projectPath: page.projectPath })
                 }
             }
         }
